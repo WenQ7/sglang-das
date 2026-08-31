@@ -17,6 +17,10 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     CombineInput,
     DispatchOutput,
 )
+from sglang.srt.layers.moe.token_dispatcher.aiter_utils import (
+    build_aiter_sink_expert_metadata,
+    should_use_aiter_runner,
+)
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPLLDispatchOutput,
@@ -471,6 +475,17 @@ class NixlEPDispatcher(BaseDispatcher):
             raise NotImplementedError("Normal mode is not supported for Nixl EP yet.")
 
         self._stage = _Stage.INITIAL
+
+        # NIXL emits DeepEP-compatible local IDs with -1 invalid slots.
+        self.expert_mask_gpu = None
+        self.aiter_expert_map_gpu = None
+        if should_use_aiter_runner() and num_local_experts is not None:
+            self.expert_mask_gpu, self.aiter_expert_map_gpu = (
+                build_aiter_sink_expert_metadata(
+                    num_local_experts,
+                    torch.cuda.current_device(),
+                )
+            )
 
     def dispatch(
         self,

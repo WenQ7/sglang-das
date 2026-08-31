@@ -10,11 +10,20 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_BLACKWELL,
     DEEPGEMM_NEED_TMA_ALIGNED_SCALES,
     DEEPGEMM_SCALE_UE8M0,
+    ENABLE_DEEPGEMM,
+    ENABLE_HCU_DEEPGEMM,
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+_HCU_DEEPGEMM_LOGGED_LAYOUTS: set[str] = set()
+
+
+def _log_hcu_deepgemm_once(layout: str) -> None:
+    if layout not in _HCU_DEEPGEMM_LOGGED_LAYOUTS:
+        logger.info("HCU DeepGEMM selected: layout=%s", layout)
+        _HCU_DEEPGEMM_LOGGED_LAYOUTS.add(layout)
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
@@ -41,6 +50,13 @@ if ENABLE_JIT_DEEPGEMM:
             return sf
         return out
 
+elif ENABLE_HCU_DEEPGEMM:
+    import deepgemm
+
+    def get_mn_major_tma_aligned_tensor(sf: torch.Tensor) -> torch.Tensor:
+        # HCU DeepGEMM consumes ordinary contiguous per-token FP32 scales.
+        return sf
+
 
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
 
@@ -57,6 +73,23 @@ def grouped_gemm_nt_f8f8bf16_masked(
     recipe_a: Optional[Tuple[int, int]] = None,
     recipe_b: Optional[Tuple[int, int]] = None,
 ):
+    if ENABLE_HCU_DEEPGEMM:
+        _log_hcu_deepgemm_once("masked")
+        if recipe_a is not None or recipe_b is not None:
+            raise NotImplementedError("HCU DeepGEMM does not use CUDA recipes")
+        return deepgemm.m_grouped_fp8_gemm_nt_masked_ll(
+            lhs,
+            rhs,
+            out,
+            masked_m,
+            expected_m,
+            **(
+                dict(enable_overlap=True, signal=overlap_args.signal)
+                if overlap_args is not None
+                else {}
+            ),
+        )
+
     num_groups, _, k = lhs[0].shape
     _, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED
@@ -115,6 +148,12 @@ def grouped_gemm_nt_bf16_masked(
     masked_m: torch.Tensor,
     expected_m: int,
 ):
+    if ENABLE_HCU_DEEPGEMM:
+        _log_hcu_deepgemm_once("bf16-masked")
+        return deepgemm.m_grouped_bf16_gemm_nt_masked(
+            a, b, d, masked_m, expected_m
+        )
+
     num_groups, _, k = a.shape
     _, n, _ = b.shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_MASKED
@@ -139,6 +178,16 @@ def grouped_gemm_nt_f8f8bf16_contig(
     recipe_a: Optional[Tuple[int, int]] = None,
     recipe_b: Optional[Tuple[int, int]] = None,
 ):
+    if ENABLE_HCU_DEEPGEMM:
+        _log_hcu_deepgemm_once("contiguous")
+        if recipe_a is not None or recipe_b is not None:
+            raise NotImplementedError("HCU DeepGEMM does not use CUDA recipes")
+        if lhs[0].shape[0] == 0:
+            return out
+        return deepgemm.m_grouped_fp8_gemm_nt_contiguous(
+            lhs, rhs, out, m_indices
+        )
+
     m, k = lhs[0].shape
     num_groups, n, _ = rhs[0].shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG
@@ -164,6 +213,10 @@ def grouped_gemm_nt_f8f8bf16_contig(
 def grouped_gemm_nt_bf16_contig(
     a: torch.Tensor, b: torch.Tensor, d: torch.Tensor, m_indices: torch.Tensor
 ):
+    if ENABLE_HCU_DEEPGEMM:
+        _log_hcu_deepgemm_once("bf16-contiguous")
+        return deepgemm.m_grouped_bf16_gemm_nt_contiguous(a, b, d, m_indices)
+
     m, k = a.shape
     num_groups, n, _ = b.shape
     kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG
@@ -177,6 +230,10 @@ def gemm_nt_f8f8bf16(
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
 ):
+    if ENABLE_HCU_DEEPGEMM:
+        raise NotImplementedError(
+            "The HCU adapter currently exposes grouped MoE GEMMs only"
+        )
     m, k = lhs[0].shape
     n, _ = rhs[0].shape
     num_groups = 1
@@ -198,6 +255,8 @@ def gemm_nt_mxfp8_f8f8bf16(
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
 ):
+    if ENABLE_HCU_DEEPGEMM:
+        raise NotImplementedError("HCU DeepGEMM does not use the MXFP8 CUDA ABI")
     m, k = lhs[0].shape
     n, _ = rhs[0].shape
     num_groups = 1
@@ -224,6 +283,10 @@ def gemm_nt_bf16bf16f32(
     rhs: torch.Tensor,
     out: torch.Tensor,
 ):
+    if ENABLE_HCU_DEEPGEMM:
+        raise NotImplementedError(
+            "The HCU adapter currently exposes grouped MoE GEMMs only"
+        )
     m, k = lhs.shape
     n, _ = rhs.shape
     num_groups = 1
@@ -240,12 +303,16 @@ def tf32_hc_prenorm_gemm(
     sqrsum: torch.Tensor,
     num_splits: Optional[int],
 ):
+    if ENABLE_HCU_DEEPGEMM:
+        raise NotImplementedError("HCU TF32 prenorm is not part of this MoE adapter")
     if x.shape[0] == 0:
         return
     deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
 
 
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
+    if ENABLE_HCU_DEEPGEMM:
+        return
     # deep_gemm.set_pdl can initialize CUDA state, so run it only after the
     # scheduler/TP worker has been forked and assigned a GPU.
     if envs.SGLANG_DEEPGEMM_PDL.get() and hasattr(deep_gemm, "set_pdl"):

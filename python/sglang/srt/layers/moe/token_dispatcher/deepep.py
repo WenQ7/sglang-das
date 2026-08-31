@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -19,20 +20,23 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
+from sglang.srt.layers.moe.token_dispatcher.aiter_utils import (
+    build_aiter_sink_expert_metadata,
+    should_use_aiter_runner,
+)
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import (
     DeepEPMode,
     DispatcherOutputDtype,
     get_deepep_config,
     get_deepep_output_dtype,
+    get_moe_runner_backend,
     is_tbo_enabled,
 )
 from sglang.srt.utils import (
-    get_bool_env_var,
     get_cuda_version,
     is_blackwell,
     is_flashinfer_available,
-    is_hip,
     is_npu,
     load_json_config,
 )
@@ -64,9 +68,92 @@ from enum import Enum, IntEnum, auto
 import torch
 import torch.distributed as dist
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
-
 logger = logging.getLogger(__name__)
+
+
+# The BW1100 DeepEP wheel exposes a vendor API where low-latency dispatch uses
+# ``topk_weight`` plus an integer ``quant_type``. Upstream DeepEP instead uses
+# ``use_fp8`` and does not require top-k weights during dispatch. Resolve the
+# ABI once at import time; signature inspection must not sit on the decode hot
+# path.
+_DEEPEP_LL_DISPATCH_USES_QUANT_TYPE = (
+    use_deepep
+    and "quant_type" in inspect.signature(Buffer.low_latency_dispatch).parameters
+)
+
+
+def _low_latency_dispatch_compat(
+    buffer,
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_max_dispatch_tokens_per_rank: int,
+    num_experts: int,
+    *,
+    use_fp8: bool,
+    use_nvfp4: bool,
+    input_global_scale: Optional[torch.Tensor],
+    round_scale: bool,
+    use_ue8m0: bool,
+    async_finish: bool,
+    return_recv_hook: bool,
+):
+    """Call either upstream or BW1100-vendor DeepEP low-latency ABI."""
+    if _DEEPEP_LL_DISPATCH_USES_QUANT_TYPE:
+        if use_nvfp4 or input_global_scale is not None:
+            raise RuntimeError(
+                "The installed DeepEP quant_type API does not support SGLang's "
+                "NVFP4/x_global_scale low-latency dispatch contract."
+            )
+
+        # Vendor quant types: 0=unquantized, 2=FP8 E4M3, 3=FP8 UE8M0.
+        quant_type = 3 if use_ue8m0 else (2 if use_fp8 else 0)
+        quant_group_size = 128 if use_ue8m0 else 0
+        return buffer.low_latency_dispatch(
+            x=hidden_states,
+            topk_idx=topk_ids,
+            topk_weight=topk_weights,
+            num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
+            num_experts=num_experts,
+            quant_type=quant_type,
+            quant_group_size=quant_group_size,
+            fp8_round_scale=round_scale or use_ue8m0,
+            async_finish=async_finish,
+            return_recv_hook=return_recv_hook,
+        )
+
+    return buffer.low_latency_dispatch(
+        hidden_states,
+        topk_ids,
+        num_max_dispatch_tokens_per_rank,
+        num_experts,
+        use_fp8=use_fp8,
+        **(dict(topk_weights=topk_weights) if _is_npu and not _use_zbal else dict()),
+        **(dict(use_nvfp4=True) if use_nvfp4 else dict()),
+        **(
+            dict(x_global_scale=input_global_scale)
+            if input_global_scale is not None
+            else dict()
+        ),
+        async_finish=async_finish,
+        return_recv_hook=return_recv_hook,
+        **(dict(round_scale=round_scale, use_ue8m0=use_ue8m0) if use_fp8 else {}),
+    )
+
+
+def _hcu_deepgemm_is_selected() -> bool:
+    """Keep package availability separate from the active MoE runner."""
+    return (
+        deep_gemm_wrapper.ENABLE_HCU_DEEPGEMM
+        and get_moe_runner_backend().is_deep_gemm()
+    )
+
+
+def _deepgemm_is_selected() -> bool:
+    # Preserve CUDA's existing JIT-DeepGEMM policy. HCU DeepGEMM is opt-in via
+    # --moe-runner-backend deep_gemm and must not alter an AITER deployment
+    # merely because the vendor package happens to be installed.
+    return deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _hcu_deepgemm_is_selected()
 
 
 def _is_mnnvl_fabric_supported() -> bool:
@@ -510,11 +597,17 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     ):
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
         topk_ids = topk_ids.to(torch.int64)
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
-            # TODO hard code 128 block quant,use fp8 communication
+        if _deepgemm_is_selected() and self.use_fp8:
+            # CUDA DeepGEMM consumes 128-wide block scales.  DTK/HCU
+            # DeepGEMM's channel-FP8 kernels consume one scale per token.
+            quant_group_size = (
+                hidden_states.shape[-1]
+                if _hcu_deepgemm_is_selected()
+                else 128
+            )
             hidden_states = sglang_per_token_group_quant_fp8(
                 hidden_states,
-                128,
+                quant_group_size,
                 column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
@@ -589,7 +682,11 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
             previous_event=previous_event,
             async_finish=self.async_finish,
             allocate_on_comm_stream=(previous_event is not None) and self.async_finish,
-            expert_alignment=128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1,
+            expert_alignment=(
+                256
+                if _hcu_deepgemm_is_selected()
+                else (128 if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM else 1)
+            ),
             config=DeepEPConfig.get_instance().normal_dispatch_config,
         )
         get_global_expert_distribution_recorder().on_deepep_dispatch_normal(
@@ -614,7 +711,7 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
         topk_weights: torch.Tensor,
     ):
 
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM or _use_aiter or _is_npu:
+        if _deepgemm_is_selected() or should_use_aiter_runner() or _is_npu:
             output = hidden_states
         else:
             raise NotImplementedError()  # triton runner was supported but it's temporarily disabled
@@ -752,26 +849,20 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         buffer = self._get_buffer()
         _deepep_precompile_tp_barrier()
         packed_recv_hidden, self.packed_recv_count, self.handle, event, hook = (
-            buffer.low_latency_dispatch(
+            _low_latency_dispatch_compat(
+                buffer,
                 hidden_states,
                 topk_ids,
+                topk_weights,
                 self.num_max_dispatch_tokens_per_rank,
                 self.num_experts,
                 use_fp8=self.use_fp8,
-                **(
-                    dict(topk_weights=topk_weights)
-                    if _is_npu and not _use_zbal
-                    else dict()
-                ),
-                **(dict(use_nvfp4=True) if self.use_nvfp4 else dict()),
-                **(
-                    dict(x_global_scale=input_global_scale)
-                    if input_global_scale is not None
-                    else dict()
-                ),
+                use_nvfp4=self.use_nvfp4,
+                input_global_scale=input_global_scale,
+                round_scale=fp8_deepgemm_scale_opts.get("round_scale", False),
+                use_ue8m0=fp8_deepgemm_scale_opts.get("use_ue8m0", False),
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
-                **fp8_deepgemm_scale_opts,
             )
         )
         return packed_recv_hidden, self.packed_recv_count, event, hook
@@ -916,14 +1007,18 @@ class DeepEPDispatcher(BaseDispatcher):
         # pre_permute reroutes them to a sink slot at index num_local_experts,
         # which is masked off here.
         self.expert_mask_gpu = None
-        if _use_aiter and num_local_experts is not None:
-            expert_mask = torch.zeros(
-                num_local_experts + 1,
-                device=torch.cuda.current_device(),
-                dtype=torch.int,
+        self.aiter_expert_map_gpu = None
+        if should_use_aiter_runner() and num_local_experts is not None:
+            expert_mask, aiter_expert_map = build_aiter_sink_expert_metadata(
+                num_local_experts,
+                torch.cuda.current_device(),
             )
-            expert_mask[:-1] = 1
             self.expert_mask_gpu = expert_mask
+            # The unified aiter.moe API consumes either a global->local map or
+            # a bool mask. Keep the legacy int mask above unchanged for other
+            # AITER users and expose an unambiguous bool view for the unified
+            # MiniMax path.
+            self.aiter_expert_map_gpu = aiter_expert_map
 
     def dispatch(
         self,

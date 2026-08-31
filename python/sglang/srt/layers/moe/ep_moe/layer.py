@@ -21,6 +21,7 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import (
     FusedMoE,
     moe_forward_piecewise_cuda_graph_impl,
 )
+from sglang.srt.layers.moe.token_dispatcher.aiter_utils import should_use_aiter_runner
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPNormalCombineInput,
@@ -42,7 +43,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
-from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils import is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -54,10 +55,45 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-
-
 logger = logging.getLogger(__name__)
+_HCU_LL_GRAPH_BRIDGE_BUFFERS: dict[
+    tuple[torch.device, tuple[int, ...], torch.dtype], torch.Tensor
+] = {}
+
+
+def _get_hcu_ll_graph_bridge(
+    hidden_states: torch.Tensor, dtype: torch.dtype
+) -> torch.Tensor:
+    bridge_key = (hidden_states.device, tuple(hidden_states.shape), dtype)
+    bridge = _HCU_LL_GRAPH_BRIDGE_BUFFERS.get(bridge_key)
+    if bridge is None:
+        bridge = torch.empty_like(hidden_states, dtype=dtype)
+        _HCU_LL_GRAPH_BRIDGE_BUFFERS[bridge_key] = bridge
+    return bridge
+
+
+def _should_use_hcu_deepgemm_runner() -> bool:
+    """Route DTK/HCU DeepGEMM through the modern dispatcher/runner stack."""
+    return (
+        deep_gemm_wrapper.ENABLE_HCU_DEEPGEMM
+        and get_moe_runner_backend().is_deep_gemm()
+    )
+
+
+def _should_break_only_hcu_deepgemm_core() -> bool:
+    """Keep DeepEP LL dispatch/combine captured and break only HCU GEMMs.
+
+    The DTK/HCU masked grouped GEMM works eagerly but segfaults when invoked
+    inside ``torch.cuda.graph``.  DeepEP low-latency dispatch/combine reaches
+    that GEMM successfully during full-graph capture, so under the breakable
+    backend the narrow safe boundary is the MoE core, not the whole A2A layer.
+    """
+    return (
+        _should_use_hcu_deepgemm_runner()
+        and get_deepep_mode()
+        .resolve(get_is_extend_in_batch())
+        .is_low_latency()
+    )
 
 
 class DeepEPMoE(FusedMoE):
@@ -105,7 +141,18 @@ class DeepEPMoE(FusedMoE):
         )
         if is_humming:
             self.deprecate_flag = True
-        elif _use_aiter:
+        # Explicit --moe-runner-backend aiter must take the modern FusedMoE
+        # dispatcher/runner path too.  Checking only SGLANG_USE_AITER misses
+        # deployments (notably MiniMax-M3 channel-FP8 on BW1100) that keep the
+        # global AITER switch off to avoid selecting AITER for dense GEMMs but
+        # opt the MoE runner in explicitly.
+        elif should_use_aiter_runner():
+            self.deprecate_flag = True
+        elif _should_use_hcu_deepgemm_runner():
+            # The legacy DeepEPMoE core contains only old CUTLASS branches and
+            # deliberately rejects DeepGEMM normal/LL outputs.  The HCU
+            # channel-FP8 adapter lives in MoeRunner(DEEP_GEMM), so select the
+            # same modern FusedMoE dispatcher/runner flow used by AITER.
             self.deprecate_flag = True
         elif _is_npu:
             self.deprecate_flag = True
@@ -187,7 +234,20 @@ class DeepEPMoE(FusedMoE):
     ) -> None:
         # eager run under breakable cuda graph
         saved_is_extend_in_batch = get_is_extend_in_batch()
-        set_is_extend_in_batch(True)
+        # The legacy eager graph break forced NORMAL DeepEP because that was
+        # the only supported implementation.  MiniMax's AITER adapter supports
+        # low-latency decode and must preserve the decode phase here; otherwise
+        # ``deepep-mode=auto`` silently runs NORMAL during decode warmup/replay.
+        force_ll_decode = (
+            get_moe_runner_backend().is_aiter()
+            and get_deepep_mode().enable_low_latency()
+        )
+        # Breakable eager callbacks do not restore ForwardContext, so the
+        # thread-local flag can still contain the startup EXTEND value during
+        # decode replay.  This callback is the decode graph boundary; choose
+        # LL explicitly for the AITER adapter. Prefill graph is disabled for
+        # this path and ordinary eager prefill does not enter this callback.
+        set_is_extend_in_batch(False if force_ll_decode else True)
         try:
             output.copy_(
                 self.forward_impl(
@@ -214,6 +274,44 @@ class DeepEPMoE(FusedMoE):
         True, capture_stub=_a2a_forward_capture_stub
     )(_a2a_forward_with_output_impl)
 
+    def _hcu_ll_moe_core_impl(self, dispatch_output: DispatchOutput):
+        # Bypass this class's routing method so replay executes the real modern
+        # quant-method runner exactly once inside the eager graph break.
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+            use_hcu_masked_output_buffer,
+        )
+
+        bridge = _get_hcu_ll_graph_bridge(
+            dispatch_output.hidden_states, self.params_dtype
+        )
+        with use_hcu_masked_output_buffer(bridge):
+            return super(DeepEPMoE, self).run_moe_core(dispatch_output)
+
+    def _hcu_ll_moe_core_capture_stub(
+        self, dispatch_output: DispatchOutput
+    ) -> DeepEPLLCombineInput:
+        if not dispatch_output.format.is_deepep_ll():
+            raise RuntimeError(
+                "HCU DeepGEMM core-only graph break requires DeepEP low-latency "
+                f"dispatch, got {dispatch_output.format}"
+            )
+        # Breakable replay is strictly segment -> eager break -> segment, so
+        # layers with the same LL capacity can share one bridge address.  A
+        # per-layer [E, M, K] BF16 buffer is ~192 MiB for MiniMax-M3 and would
+        # otherwise retain more than 10 GiB across its 57 MoE layers.
+        bridge = _get_hcu_ll_graph_bridge(
+            dispatch_output.hidden_states, self.params_dtype
+        )
+        return DeepEPLLCombineInput(
+            hidden_states=bridge,
+            topk_ids=dispatch_output.topk_ids,
+            topk_weights=dispatch_output.topk_weights,
+        )
+
+    hcu_ll_moe_core = eager_on_graph(
+        True, capture_stub=_hcu_ll_moe_core_capture_stub
+    )(_hcu_ll_moe_core_impl)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -221,6 +319,11 @@ class DeepEPMoE(FusedMoE):
     ):
         # DeepEP NORMAL mode is not capturable; run it as an eager node.
         if is_in_breakable_cuda_graph():
+            if _should_break_only_hcu_deepgemm_core():
+                # Low-latency DeepEP is graph-capturable on HCU.  Let the
+                # modern FusedMoE forward capture dispatch/combine and insert
+                # its eager break only around the vendor grouped GEMMs.
+                return self.forward_impl(hidden_states, topk_output)
             assert TopKOutputChecker.format_is_standard(
                 topk_output
             ), "Only standard topk output is supported for breakable cuda graph"
@@ -281,6 +384,11 @@ class DeepEPMoE(FusedMoE):
     ):
 
         if self.deprecate_flag:
+            if (
+                is_in_breakable_cuda_graph()
+                and _should_break_only_hcu_deepgemm_core()
+            ):
+                return self.hcu_ll_moe_core(dispatch_output)
             return super().run_moe_core(dispatch_output)
 
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker

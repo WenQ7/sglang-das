@@ -18,6 +18,10 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
     DispatchOutput,
     DispatchOutputFormat,
 )
+from sglang.srt.layers.moe.token_dispatcher.aiter_utils import (
+    build_aiter_sink_expert_metadata,
+    should_use_aiter_runner,
+)
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
 from sglang.srt.utils import get_int_env_var
@@ -339,6 +343,19 @@ class MooncakeEPDispatcher(BaseDispatcher):
             raise NotImplementedError
 
         self._stage = _Stage.INITIAL
+
+        # Mooncake uses the same -1 invalid-slot convention and DEEPEP_LL
+        # runner format as DeepEP.  Preserve the legacy integer sink mask and
+        # expose a bool mask for unified aiter_moe (MiniMax-M3 alpha/limit).
+        self.expert_mask_gpu = None
+        self.aiter_expert_map_gpu = None
+        if should_use_aiter_runner() and num_local_experts is not None:
+            self.expert_mask_gpu, self.aiter_expert_map_gpu = (
+                build_aiter_sink_expert_metadata(
+                    num_local_experts,
+                    torch.cuda.current_device(),
+                )
+            )
 
     def dispatch(
         self,

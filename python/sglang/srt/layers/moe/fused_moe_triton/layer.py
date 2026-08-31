@@ -539,7 +539,7 @@ class FusedMoE(torch.nn.Module):
         # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
         # 3. GPU with Aiter padding
         aiter_padded = (
-            _use_aiter
+            (_use_aiter or get_moe_runner_backend().is_aiter())
             and hasattr(self, "w2_weight")
             and getattr(self.w2_weight, "weight_padded", False)
         )
