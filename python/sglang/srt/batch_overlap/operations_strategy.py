@@ -73,6 +73,15 @@ class OperationsStrategy:
                     for layer in layers
                 ]
             )
+        elif layer_name == "MiniMaxM3DecoderLayer":
+            return OperationsStrategy.concat(
+                [
+                    _compute_minimax_m3_layer_operations_strategy_tbo(
+                        layer, forward_mode
+                    )
+                    for layer in layers
+                ]
+            )
         else:
             raise NotImplementedError
 
@@ -156,6 +165,39 @@ def _compute_moe_deepseek_blog_decode(layer):
             operations.YieldOperation(),
             layer.mlp.op_output,
             layer.op_comm_postprocess_layer,
+        ],
+    )
+
+
+# -------------------------------- Strategy for MiniMax-M3 ---------------------------------------
+
+
+def _compute_minimax_m3_layer_operations_strategy_tbo(layer, forward_mode):
+    if not (
+        forward_mode == ForwardMode.DECODE
+        or forward_mode == ForwardMode.TARGET_VERIFY
+    ):
+        raise NotImplementedError(f"Unsupported MiniMax-M3 {forward_mode=}")
+
+    return OperationsStrategy(
+        deep_gemm_num_sms=None,
+        # Advance A and B at the same stage index.  Since the executor runs A
+        # first, A launches its gather and returns; B's attention then overlaps
+        # that gather.  The next stage similarly overlaps A's combine with B's
+        # MoE.  A positive delta would make A wait before B starts and serialize
+        # the very communication this strategy is intended to hide.
+        tbo_delta_stages=0,
+        operations=[
+            layer.op_comm_prepare_attn,
+            layer.self_attn.op_prepare,
+            layer.self_attn.op_core,
+            layer.op_gather_a,
+            operations.YieldOperation(),
+            layer.op_gather_b,
+            layer.op_mlp,
+            layer.op_combine_a,
+            operations.YieldOperation(),
+            layer.op_combine_b,
         ],
     )
 

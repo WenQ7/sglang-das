@@ -215,6 +215,42 @@ class TestMiniMaxGates(_FusionGateCase):
         )
         self.assertIn("quantization formats", reason)
 
+    def test_enforce_allows_one_shared_expert_on_a_validated_non_cuda_backend(self):
+        from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
+
+        self._seed(enforce_shared_experts_fusion=True)
+        self.assertIsNone(
+            self._reason(
+                MiniMaxM3SparseForCausalLM,
+                SimpleNamespace(n_shared_experts=1),
+                _quant("w8a8_fp8"),
+            )
+        )
+
+    def test_enforce_does_not_override_the_mixed_precision_veto(self):
+        from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
+
+        self._seed(enforce_shared_experts_fusion=True)
+        self.assertIn(
+            "quantization formats",
+            self._reason(
+                MiniMaxM3SparseForCausalLM,
+                SimpleNamespace(n_shared_experts=1),
+                _quant("modelopt_mixed"),
+            ),
+        )
+
+    def test_enforce_rejects_multiple_shared_experts(self):
+        from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
+
+        self._seed(enforce_shared_experts_fusion=True)
+        with self.assertRaisesRegex(ValueError, "exactly one shared"):
+            self._reason(
+                MiniMaxM3SparseForCausalLM,
+                SimpleNamespace(n_shared_experts=2),
+                _quant("w8a8_fp8"),
+            )
+
     def test_the_vl_variant_reads_the_text_config(self):
         from sglang.srt.models.minimax_m3_vl import (
             MiniMaxM3SparseForConditionalGeneration,

@@ -1,6 +1,7 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
 import logging
+import os
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -17,11 +18,31 @@ from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx imp
     flash_prefill_with_topk_index,
 )
 from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
+    build_query_group_topk_union,
     flash_prefill_with_gqa_share_sparse,
 )
+from sglang.srt.layers.dcp.comm import cp_lse_ag_out_rs_mha
 
 logger = logging.getLogger(__name__)
 _msa_fallback_warned = False
+
+
+def _flatten_main_kv_cache(cache: torch.Tensor) -> torch.Tensor:
+    """Normalize paged main KV cache to the slot-major layout sparse kernels use."""
+    if cache.dim() == 3:
+        return cache
+    if cache.dim() != 4:
+        raise ValueError(
+            "MiniMax sparse attention expects a 3D slot cache or a 4D paged "
+            f"cache, got shape={tuple(cache.shape)}"
+        )
+    if not cache.is_contiguous():
+        raise ValueError(
+            "MiniMax sparse attention requires a contiguous 4D paged cache for "
+            f"slot flattening, got shape={tuple(cache.shape)}, stride={cache.stride()}"
+        )
+    # [num_pages, page_size, num_kv_heads, head_dim]
+    return cache.view(-1, cache.shape[-2], cache.shape[-1])
 
 
 def _warn_msa_fallback(err: Exception) -> None:
@@ -73,6 +94,10 @@ def minimax_sparse_prefill(
     idx_q_scale: Optional[float] = None,
     idx_k_scale: Optional[float] = None,
     idx_v_scale: Optional[float] = None,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    dcp_group=None,
+    logical_max_seqlen_q: Optional[int] = None,
 ):
     """Run MiniMax-M3 sparse prefill.
 
@@ -82,6 +107,47 @@ def minimax_sparse_prefill(
     ``seqlens_cpu`` (host copy of ``torch.diff(cu_seqlens)``) is forwarded to
     ``get_cu_seqblocks`` to avoid a per-layer device sync when it recomputes.
     """
+    k_cache = _flatten_main_kv_cache(k_cache)
+    v_cache = _flatten_main_kv_cache(v_cache)
+    if dcp_size > 1:
+        if dcp_size != 2:
+            raise NotImplementedError(
+                "MiniMax-M3 DCP prefill currently supports DCP2 only"
+            )
+        if dcp_group is None or dcp_group.world_size != dcp_size:
+            raise ValueError("MiniMax-M3 DCP2 prefill requires its matching group")
+        if score_type != "max" or not disable_index_value:
+            raise NotImplementedError(
+                "MiniMax-M3 DCP2 prefill requires score_type='max' and "
+                "disable_index_value=True"
+            )
+        if use_msa or sink is not None or idx_sink is not None:
+            raise NotImplementedError(
+                "MiniMax-M3 DCP2 prefill requires Triton sparse attention "
+                "without sinks"
+            )
+    # The main sparse kernel tiles Q and all GQA heads together and requires
+    # BLOCK_SIZE_Q * gqa_group_size <= 128.  TP/DP choices change the local GQA
+    # group, so clamp the requested query block to the largest supported power
+    # of two instead of making one launch-script value fail under another
+    # parallel layout.
+    num_q_heads = q.shape[1]
+    num_kv_heads = k_cache.shape[1]
+    if num_q_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"MiniMax sparse GQA mismatch: q_heads={num_q_heads}, "
+            f"kv_heads={num_kv_heads}"
+        )
+    gqa_group_size = num_q_heads // num_kv_heads
+    main_max_qh = int(os.environ.get("SGLANG_MINIMAX_PREFILL_MAIN_MAX_QH", "128"))
+    if main_max_qh not in (128, 256):
+        raise ValueError(
+            "SGLANG_MINIMAX_PREFILL_MAIN_MAX_QH must be 128 or 256, "
+            f"got {main_max_qh}"
+        )
+    max_block_size_q = max(1, main_max_qh // (gqa_group_size * dcp_size))
+    while block_size_q > max_block_size_q:
+        block_size_q //= 2
     if cu_seqblocks_q is None or max_seqblock_q is None or all_seqblock_q is None:
         cu_seqblocks_q, max_seqblock_q, all_seqblock_q, _, _, _ = get_cu_seqblocks(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k, seqlens_cpu
@@ -115,6 +181,9 @@ def minimax_sparse_prefill(
         q_scale=idx_q_scale,
         k_scale=idx_k_scale,
         v_scale=idx_v_scale,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        dcp_group=dcp_group,
     )
     # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
     num_idx_heads = idx_q.shape[1]
@@ -124,6 +193,153 @@ def minimax_sparse_prefill(
         topk_idx = topk_index_reduce(
             topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
         )
+    q_for_main = (
+        dcp_group.all_gather(q.contiguous(), dim=1).contiguous()
+        if dcp_size > 1
+        else q
+    )
+    main_block_size_q = block_size_q
+    main_cu_seqblocks_q = cu_seqblocks_q
+    main_max_seqblock_q = max_seqblock_q
+    per_query_topk_idx = None
+    query_group_mask = None
+    exact_grouped_main_q = int(
+        os.environ.get("SGLANG_MINIMAX_PREFILL_EXACT_GROUPED_MAIN_Q", "1")
+    )
+    # Query-sharded prefill CP passes a local max_seqlen_q (16K / CP8 = 2K).
+    # Selection thresholds describe the user-visible logical request, so use
+    # the pre-sharding length supplied by the backend when it is available.
+    exact_grouped_main_query_len = (
+        max_seqlen_q
+        if logical_max_seqlen_q is None
+        else int(logical_max_seqlen_q)
+    )
+    exact_grouped_main_min_query_len = int(
+        os.environ.get(
+            "SGLANG_MINIMAX_PREFILL_EXACT_GROUPED_MAIN_MIN_QUERY_LEN", "4096"
+        )
+    )
+    exact_grouped_main_max_query_len = int(
+        os.environ.get(
+            "SGLANG_MINIMAX_PREFILL_EXACT_GROUPED_MAIN_MAX_QUERY_LEN", "32768"
+        )
+    )
+    if exact_grouped_main_q < 1:
+        raise ValueError(
+            "SGLANG_MINIMAX_PREFILL_EXACT_GROUPED_MAIN_Q must be >= 1, "
+            f"got {exact_grouped_main_q}"
+        )
+    if exact_grouped_main_q & (exact_grouped_main_q - 1):
+        raise ValueError(
+            "SGLANG_MINIMAX_PREFILL_EXACT_GROUPED_MAIN_Q must be a power of two, "
+            f"got {exact_grouped_main_q}"
+        )
+    if exact_grouped_main_min_query_len < 0:
+        raise ValueError(
+            "SGLANG_MINIMAX_PREFILL_EXACT_GROUPED_MAIN_MIN_QUERY_LEN must be "
+            f">= 0, got {exact_grouped_main_min_query_len}"
+        )
+    if exact_grouped_main_max_query_len < 0:
+        raise ValueError(
+            "SGLANG_MINIMAX_PREFILL_EXACT_GROUPED_MAIN_MAX_QUERY_LEN must be "
+            f">= 0, got {exact_grouped_main_max_query_len}"
+        )
+    while exact_grouped_main_q > max_block_size_q:
+        exact_grouped_main_q //= 2
+
+    # Exact Q1 index selection and grouped main attention are independent.
+    # The indexer above still computes one score row and one exact Top-K set for
+    # every query.  Grouping only unions those already-final sets for the main
+    # attention kernel, whose per-query membership mask excludes every block
+    # not selected by that query.  Therefore this changes scheduling and KV
+    # reuse, not sparse-attention semantics.  Limit the optimization to the
+    # long cache-hit extend window by default: using it while constructing the
+    # 128K causal prefix changes a handful of BF16 reductions and then persists
+    # those differences in the KV cache.  A zero length bound disables that
+    # side of the range check.
+    if (
+        block_size_q == 1
+        and exact_grouped_main_q > 1
+        and (
+            exact_grouped_main_min_query_len == 0
+            or exact_grouped_main_query_len >= exact_grouped_main_min_query_len
+        )
+        and (
+            exact_grouped_main_max_query_len == 0
+            or exact_grouped_main_query_len <= exact_grouped_main_max_query_len
+        )
+        and dcp_size == 1
+        and topk_idx.shape[1] == q.shape[0]
+    ):
+        (
+            main_cu_seqblocks_q,
+            main_max_seqblock_q,
+            main_all_seqblock_q,
+            _,
+            _,
+            _,
+        ) = get_cu_seqblocks(
+            cu_seqlens,
+            max_seqlen_q,
+            exact_grouped_main_q,
+            block_size_k,
+            seqlens_cpu,
+        )
+        per_query_topk_idx = topk_idx
+        precompute_union_bitmask = (
+            os.environ.get("SGLANG_MINIMAX_PREFILL_UNION_BITMASK", "0") == "1"
+        )
+        grouped_union = build_query_group_topk_union(
+            topk_idx,
+            cu_seqlens,
+            main_cu_seqblocks_q,
+            exact_grouped_main_q,
+            all_groups=main_all_seqblock_q,
+            max_num_blocks=(max_seqlen_k + block_size_k - 1) // block_size_k,
+            max_union=int(
+                os.environ.get(
+                    "SGLANG_MINIMAX_PREFILL_EXACT_GROUPED_MAIN_MAX",
+                    str(exact_grouped_main_q * topk),
+                )
+            ),
+            return_query_mask=precompute_union_bitmask,
+        )
+        if precompute_union_bitmask:
+            topk_idx, query_group_mask = grouped_union
+        else:
+            topk_idx = grouped_union
+        main_block_size_q = exact_grouped_main_q
+    elif block_size_q > 1 and topk_idx.shape[1] == q.shape[0]:
+        if os.environ.get("SGLANG_MINIMAX_PREFILL_GROUPED_UNION_MAIN", "0") == "1":
+            per_query_topk_idx = topk_idx
+            topk_idx = build_query_group_topk_union(
+                topk_idx,
+                cu_seqlens,
+                cu_seqblocks_q,
+                block_size_q,
+                all_groups=all_seqblock_q,
+                max_num_blocks=(max_seqlen_k + block_size_k - 1) // block_size_k,
+                max_union=int(
+                    os.environ.get(
+                        "SGLANG_MINIMAX_PREFILL_GROUPED_UNION_MAX",
+                        str(block_size_q * topk),
+                    )
+                ),
+            )
+        else:
+            # Candidate reranking emits one Top-K row for every query.  Use the
+            # established Q1 consumer when grouped-union attention is disabled.
+            main_block_size_q = 1
+            (
+                main_cu_seqblocks_q,
+                main_max_seqblock_q,
+                _,
+                _,
+                _,
+                _,
+            ) = get_cu_seqblocks(
+                cu_seqlens, max_seqlen_q, 1, block_size_k, seqlens_cpu
+            )
     # Step 3: Sparse attention using topk index (main head). The MSA path only
     # replaces this step; the indexer above is unchanged. MSA has no attn-sink
     # input, so keep the Triton path when sink is present.
@@ -132,10 +348,12 @@ def minimax_sparse_prefill(
 
         try:
             o = msa_sparse_prefill_main(
-                q=q,
+                q=q_for_main,
                 k_cache=k_cache,
                 v_cache=v_cache,
                 topk_idx=topk_idx,
+                per_query_topk_idx=per_query_topk_idx,
+                query_group_mask=query_group_mask,
                 req_to_token=req_to_token,
                 slot_ids=slot_ids,
                 cu_seqlens=cu_seqlens,
@@ -150,47 +368,61 @@ def minimax_sparse_prefill(
         except MSAUnavailableError as err:
             _warn_msa_fallback(err)
             o = flash_prefill_with_gqa_share_sparse(
-                q=q,
+                q=q_for_main,
                 k_cache=k_cache,
                 v_cache=v_cache,
                 sink=sink,
                 req_to_token=req_to_token,
                 slot_ids=slot_ids,
                 topk_idx=topk_idx,
-                block_size_q=block_size_q,
+                per_query_topk_idx=per_query_topk_idx,
+                block_size_q=main_block_size_q,
                 block_size_k=block_size_k,
                 cu_seqlens=cu_seqlens,
                 seq_lens=seq_lens,
                 prefix_lens=prefix_lens,
                 max_seqlen_q=max_seqlen_q,
                 sm_scale=sm_scale,
-                cu_seqblocks_q=cu_seqblocks_q,
-                max_seqblock_q=max_seqblock_q,
+                cu_seqblocks_q=main_cu_seqblocks_q,
+                max_seqblock_q=main_max_seqblock_q,
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                dcp_size=dcp_size,
+                dcp_rank=dcp_rank,
+                return_lse=dcp_size > 1,
             )
     else:
         o = flash_prefill_with_gqa_share_sparse(
-            q=q,
+            q=q_for_main,
             k_cache=k_cache,
             v_cache=v_cache,
             sink=sink,
             req_to_token=req_to_token,
             slot_ids=slot_ids,
             topk_idx=topk_idx,
-            block_size_q=block_size_q,
+            per_query_topk_idx=per_query_topk_idx,
+            query_group_mask=query_group_mask,
+            block_size_q=main_block_size_q,
             block_size_k=block_size_k,
             cu_seqlens=cu_seqlens,
             seq_lens=seq_lens,
             prefix_lens=prefix_lens,
             max_seqlen_q=max_seqlen_q,
             sm_scale=sm_scale,
-            cu_seqblocks_q=cu_seqblocks_q,
-            max_seqblock_q=max_seqblock_q,
+            cu_seqblocks_q=main_cu_seqblocks_q,
+            max_seqblock_q=main_max_seqblock_q,
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            return_lse=dcp_size > 1,
+        )
+    if dcp_size > 1:
+        o, local_lse = o
+        o = cp_lse_ag_out_rs_mha(
+            o, local_lse, dcp_group, use_reduce_scatter=True
         )
     return idx_o, o
 
@@ -232,7 +464,32 @@ def minimax_sparse_decode(
     idx_q_scale: Optional[float] = None,
     idx_k_scale: Optional[float] = None,
     idx_v_scale: Optional[float] = None,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    dcp_group=None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    k_cache = _flatten_main_kv_cache(k_cache)
+    v_cache = _flatten_main_kv_cache(v_cache)
+    if dcp_size > 1:
+        if dcp_size != 2:
+            raise NotImplementedError(
+                "MiniMax-M3 DCP currently supports only DCP2, matching its "
+                "two-way replicated Main/Index KV heads"
+            )
+        if dcp_group is None or dcp_group.world_size != dcp_size:
+            raise ValueError("MiniMax-M3 DCP2 requires its matching DCP group")
+        if score_type != "max" or not disable_index_value:
+            raise NotImplementedError(
+                "MiniMax-M3 DCP2 requires score_type='max' and "
+                "disable_index_value=True"
+            )
+        if dense_main_attn_fn is not None or use_msa:
+            raise NotImplementedError(
+                "MiniMax-M3 DCP2 currently supports only the Triton sparse "
+                "main-attention path"
+            )
+        if sink is not None or idx_sink is not None:
+            raise NotImplementedError("MiniMax-M3 DCP2 does not yet support sinks")
     # Step 1: Flash decode with topk index (using index head). When the dense main
     # attention is used, the indexer emits the page table directly (fused
     # transform) instead of block ids, plus the per-query effective KV length.
@@ -257,6 +514,9 @@ def minimax_sparse_decode(
         q_scale=idx_q_scale,
         k_scale=idx_k_scale,
         v_scale=idx_v_scale,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        dcp_group=dcp_group,
     )
     num_idx_heads = idx_q.shape[1]
     num_kv_heads = k_cache.shape[1]
@@ -271,6 +531,14 @@ def minimax_sparse_decode(
             topk_idx = topk_index_reduce(
                 topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
             )
+        # Adjacent DCP2 ranks already replicate the same MiniMax KV head while
+        # owning different Q-head shards. Gather those Q heads, attend only to
+        # this rank's token shard, then merge the two partial softmaxes by LSE.
+        q_for_main = (
+            dcp_group.all_gather(q.contiguous(), dim=1).contiguous()
+            if dcp_size > 1
+            else q
+        )
         # Step 3: Sparse attention using topk index (main head). The MSA path
         # only replaces this step; keep the Triton path when sink is present.
         if use_msa and sink is None:
@@ -278,7 +546,7 @@ def minimax_sparse_decode(
 
             try:
                 o = msa_sparse_decode_main(
-                    q=q,
+                    q=q_for_main,
                     k_cache=k_cache,
                     v_cache=v_cache,
                     topk_idx=topk_idx,
@@ -296,7 +564,7 @@ def minimax_sparse_decode(
             except MSAUnavailableError as err:
                 _warn_msa_fallback(err)
                 o = flash_decode_with_gqa_share_sparse(
-                    q=q,
+                    q=q_for_main,
                     sink=sink,
                     k_cache=k_cache,
                     v_cache=v_cache,
@@ -309,10 +577,13 @@ def minimax_sparse_decode(
                     q_scale=q_scale,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    dcp_size=dcp_size,
+                    dcp_rank=dcp_rank,
+                    return_lse=dcp_size > 1,
                 )
         else:
             o = flash_decode_with_gqa_share_sparse(
-                q=q,
+                q=q_for_main,
                 sink=sink,
                 k_cache=k_cache,
                 v_cache=v_cache,
@@ -325,5 +596,13 @@ def minimax_sparse_decode(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                dcp_size=dcp_size,
+                dcp_rank=dcp_rank,
+                return_lse=dcp_size > 1,
+            )
+        if dcp_size > 1:
+            o, local_lse = o
+            o = cp_lse_ag_out_rs_mha(
+                o, local_lse, dcp_group, use_reduce_scatter=True
             )
     return idx_o, o

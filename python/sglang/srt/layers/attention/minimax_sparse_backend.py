@@ -7,6 +7,9 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.minimax_sparse.common.utils import (
+    get_dcp_cache_store_loc_and_mask,
+)
 from sglang.srt.configs.model_config import (
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
@@ -18,8 +21,11 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
+from sglang.srt.layers.cp.base import get_cp_strategy
+from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 from sglang.srt.utils import is_npu
 
@@ -49,6 +55,16 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+_minimax_sparse_cp_logged = False
+
+
+def _get_minimax_num_key_value_heads(model_config) -> int:
+    """Read the language-model KV-head count from text or flat HF configs."""
+    text_config = getattr(model_config, "hf_text_config", None)
+    if text_config is None:
+        hf_config = model_config.hf_config
+        text_config = getattr(hf_config, "text_config", hf_config)
+    return int(text_config.num_key_value_heads)
 
 
 def _kv_cache_to_bnsd(
@@ -145,7 +161,134 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._decode_seq_lens_i32_cg: dict[int, torch.Tensor] = {}
         self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
 
-        self.block_size_q = 1
+        # Experimental query-sharded prefill CP.  Each rank computes only its
+        # zigzag query slices, while Main K/V and Index K/V for the new chunk
+        # are materialized on every CP rank.  This preserves the existing
+        # exact local Top-K algorithm and avoids a distributed Top-K in the
+        # first implementation.
+        self.enable_query_sharded_cp = os.environ.get(
+            "SGLANG_OPT_USE_MINIMAX_QUERY_SHARDED_CP", "0"
+        ) in ("1", "true", "True")
+        parallel = get_parallel()
+        self.dcp_size = parallel.attn_dcp_size
+        self.dcp_rank = parallel.attn_dcp_rank
+        # The framework does not construct a DCP process group for the
+        # ordinary DCP1 topology.  Resolve it lazily only for an actual
+        # multi-rank DCP run so the baseline MiniMax backend still boots.
+        self.dcp_group = parallel.dcp_group if self.dcp_size > 1 else None
+        self.enable_dcp2 = os.environ.get(
+            "SGLANG_OPT_USE_MINIMAX_DCP2", "0"
+        ) in ("1", "true", "True")
+        if self.dcp_size > 1:
+            if not self.enable_dcp2:
+                raise RuntimeError(
+                    "MiniMax-M3 DCP is experimental; set "
+                    "SGLANG_OPT_USE_MINIMAX_DCP2=1 to enable the DCP2 path"
+                )
+            if self.dcp_size != 2:
+                raise RuntimeError(
+                    "MiniMax-M3 currently supports only DCP2 because its KV "
+                    "heads are replicated across adjacent TP-rank pairs"
+                )
+            if self.is_npu or self.kv_pool.page_size != 1:
+                raise RuntimeError(
+                    "MiniMax-M3 DCP2 currently requires CUDA/HIP Triton sparse "
+                    "attention with --page-size 1"
+                )
+            # MiniMax-M3 checkpoints use a VL wrapper config; language-model
+            # dimensions live in hf_text_config/text_config, not necessarily
+            # on the outer MiniMaxM3VLConfig.
+            total_main_kv_heads = _get_minimax_num_key_value_heads(
+                runner.model_config
+            )
+            total_index_heads = int(sparse_cfg["sparse_num_index_heads"])
+            main_replica_size = (
+                parallel.attn_tp_size // total_main_kv_heads
+                if total_main_kv_heads < parallel.attn_tp_size
+                and parallel.attn_tp_size % total_main_kv_heads == 0
+                else 1
+            )
+            index_replica_size = (
+                parallel.attn_tp_size // total_index_heads
+                if total_index_heads < parallel.attn_tp_size
+                and parallel.attn_tp_size % total_index_heads == 0
+                else 1
+            )
+            if (main_replica_size, index_replica_size) != (
+                self.dcp_size,
+                self.dcp_size,
+            ):
+                raise RuntimeError(
+                    "MiniMax-M3 DCP2 requires Main and Index KV replication "
+                    "groups to match DCP2 exactly, got "
+                    f"main_replica={main_replica_size}, "
+                    f"index_replica={index_replica_size}, "
+                    f"attention_tp={parallel.attn_tp_size}"
+                )
+            if (
+                self.score_type != "max"
+                or set(self.sparse_layer_ids) != self.disable_value_layer_ids
+            ):
+                raise RuntimeError(
+                    "MiniMax-M3 DCP2 requires score_type=max and Index Value "
+                    "disabled on every sparse layer"
+                )
+            if self.enable_query_sharded_cp:
+                raise RuntimeError(
+                    "MiniMax query-sharded prefill CP and DCP2 cannot be enabled "
+                    "in the same server"
+                )
+            logger.warning(
+                "MiniMax-M3 DCP2 selected: exact distributed block-max TopK, "
+                "token-sharded Main/Index KV, and O/LSE merge are enabled. "
+                "This path is experimental and requires parity/performance gates."
+            )
+
+        # Share one selected sparse-KV block set across a small group of
+        # adjacent prefill queries.  The original GPU default (1) launches one
+        # program per query and is prohibitively slow for MiniMax-M3's 16K
+        # extend-on-128K workload.  Keep the source default conservative, but
+        # expose the same query blocking already used by the NPU path so ROCm
+        # deployments can opt into the throughput-oriented mode.
+        self.block_size_q = int(
+            os.environ.get("SGLANG_MINIMAX_PREFILL_BLOCK_SIZE_Q", "1")
+        )
+        if self.block_size_q not in (1, 2, 4, 8, 16, 32, 64):
+            raise ValueError(
+                "SGLANG_MINIMAX_PREFILL_BLOCK_SIZE_Q must be one of "
+                "1,2,4,8,16,32,64, got "
+                f"{self.block_size_q}"
+            )
+        self.block_size_q_min_query_len = int(
+            os.environ.get(
+                "SGLANG_MINIMAX_PREFILL_BLOCK_SIZE_Q_MIN_QUERY_LEN", "4096"
+            )
+        )
+        if self.block_size_q_min_query_len < 0:
+            raise ValueError(
+                "SGLANG_MINIMAX_PREFILL_BLOCK_SIZE_Q_MIN_QUERY_LEN must be >= 0, "
+                f"got {self.block_size_q_min_query_len}"
+            )
+        self.block_size_q_max_query_len = int(
+            os.environ.get("SGLANG_MINIMAX_PREFILL_BLOCK_SIZE_Q_MAX_QUERY_LEN", "0")
+        )
+        if self.block_size_q_max_query_len < 0:
+            raise ValueError(
+                "SGLANG_MINIMAX_PREFILL_BLOCK_SIZE_Q_MAX_QUERY_LEN must be >= 0, "
+                f"got {self.block_size_q_max_query_len}"
+            )
+        self._last_gpu_prefill_block_size_q: Optional[int] = None
+        if self.block_size_q > 1:
+            logger.warning(
+                "MiniMax sparse prefill is using approximate query blocking: "
+                "block_size_q=%d. Adjacent queries share one sparse top-k block "
+                "selection when max_query_len >= %d; shorter prefills stay on the "
+                "accuracy-safe block_size_q=1 path. The blocked path is not "
+                "numerically equivalent to Q1, so run the full model accuracy gate "
+                "before using it in production.",
+                self.block_size_q,
+                self.block_size_q_min_query_len,
+            )
         self.block_size_k = sparse_cfg["sparse_block_size"]
         if "sparse_init_block" in sparse_cfg:
             self.init_blocks = sparse_cfg["sparse_init_block"]
@@ -194,7 +337,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 and self.kv_pool.main_pool.dtype == torch.float8_e4m3fn
             )
             self.use_msa = (
-                not envs.SGLANG_DISABLE_MSA.get()
+                self.dcp_size == 1
+                and not envs.SGLANG_DISABLE_MSA.get()
                 and msa_available()
                 and self.block_size_k == 128
                 and self.kv_pool.page_size == self.block_size_k
@@ -219,8 +363,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         self._msa_dec_meta = None
         if self.use_msa:
-            from sglang.srt.runtime_context import get_parallel
-
             self.num_q_heads = (
                 runner.model_config.num_attention_heads // get_parallel().attn_tp_size
             )
@@ -233,6 +375,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.page_size = self.kv_pool.page_size
         self.use_dense_sparse_decode = (
             (not self.is_npu)
+            and self.dcp_size == 1
             and envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
             and self.block_size_k % self.page_size == 0
             # _dense_sparse_main_decode calls trtllm decode with a bf16 q and
@@ -280,6 +423,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             f"msa_decode={self._use_msa_decode}, "
             f"msa_owns_decode={self._msa_owns_decode}, "
             f"decode_cuda_graph={_decode_cuda_graph}, "
+            f"prefill_block_q={self.block_size_q}, "
+            f"prefill_block_q_min_query_len={self.block_size_q_min_query_len}, "
             f"fp8_attn_gemm={self.fp8_attn_gemm}, "
             f"npu_native_attn={'on' if (self._native_sparse_ok and _native_attn_enabled()) else 'off'}, "
             f"disable_value_layers={sorted(self.disable_value_layer_ids)})"
@@ -290,6 +435,41 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 "JIT-compile fmha_sm100 fp8 kernel variants (cold cache can "
                 "take minutes; compiles serialize across TP ranks)."
             )
+
+    def _select_gpu_prefill_block_size_q(self) -> int:
+        """Use exact Q1 for short prompts and blocked Q for long extends.
+
+        The 128K-prefix + 16K-extend target benefits heavily from sharing one
+        sparse block selection across adjacent queries. Applying that same
+        approximation to short accuracy prompts is unnecessary and can move
+        model-level scores. A threshold of zero disables this adaptive fallback.
+        """
+        selected = self.block_size_q
+        if (
+            selected > 1
+            and self.block_size_q_min_query_len > 0
+            and int(self._max_seqlen_q) < self.block_size_q_min_query_len
+        ):
+            selected = 1
+        if (
+            selected > 1
+            and self.block_size_q_max_query_len > 0
+            and int(self._max_seqlen_q) > self.block_size_q_max_query_len
+        ):
+            selected = 1
+        if selected != self._last_gpu_prefill_block_size_q:
+            logger.info(
+                "[MiniMaxSparse] selected GPU prefill block-Q=%d "
+                "(configured=%d, max_query_len=%d, fast_path_min_query_len=%d, "
+                "fast_path_max_query_len=%d)",
+                selected,
+                self.block_size_q,
+                int(self._max_seqlen_q),
+                self.block_size_q_min_query_len,
+                self.block_size_q_max_query_len,
+            )
+            self._last_gpu_prefill_block_size_q = selected
+        return selected
 
     @staticmethod
     def _choose_decode_score_max_chunks(batch_size: int) -> int:
@@ -1233,6 +1413,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         layer_ids = forward_batch.minimax_m3_precached_sparse_layers
         return layer_ids is not None and layer_id in layer_ids
 
+    def _cache_store_loc_and_mask(
+        self, forward_batch: ForwardBatch
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Translate DCP virtual slots and return this rank's token mask."""
+        return get_dcp_cache_store_loc_and_mask(
+            forward_batch.out_cache_loc,
+            forward_batch.positions,
+            forward_batch.dcp_kv_mask,
+            self.dcp_size,
+            self.dcp_rank,
+        )
+
     def forward(
         self,
         q,
@@ -1309,6 +1501,51 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._extend_meta_key = id(forward_batch)
         return cu_seqlens, seq_lens, prefix_lens
 
+    def _materialize_query_sharded_cp_kv(
+        self,
+        forward_batch: ForwardBatch,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        idx_k: torch.Tensor,
+        idx_v: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """All-gather one CP-local MiniMax KV payload in a single collective."""
+        strategy = get_cp_strategy()
+        if strategy is None or strategy.name != "zigzag":
+            raise RuntimeError(
+                "MiniMax query-sharded CP requires CP-v2 with --cp-strategy zigzag"
+            )
+
+        parts = [k, v, idx_k]
+        if idx_v is not None:
+            parts.append(idx_v)
+        if len({part.dtype for part in parts}) != 1:
+            raise RuntimeError(
+                "MiniMax query-sharded CP requires Main/Index projection tensors "
+                "to share a dtype before KV-cache storage"
+            )
+
+        shapes = [tuple(part.shape[1:]) for part in parts]
+        # Derive the row widths from shape rather than indexing row zero.  CP
+        # normally rejects empty local shards, but keeping this zero-token safe
+        # makes the packing helper robust to future padding/layout changes.
+        widths = [part.flatten(1).shape[1] for part in parts]
+        packed = torch.cat([part.flatten(1) for part in parts], dim=1).contiguous()
+        packed_full = strategy.gather_kv_cache(
+            packed, forward_batch, torch.cuda.current_stream()
+        )
+        full_parts = packed_full.split(widths, dim=1)
+        restored = [
+            part.reshape(packed_full.shape[0], *shape).contiguous()
+            for part, shape in zip(full_parts, shapes)
+        ]
+        return (
+            restored[0],
+            restored[1],
+            restored[2],
+            None if idx_v is None else restored[3],
+        )
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1323,13 +1560,43 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         idx_v: Optional[torch.Tensor],
     ):
         disable_value = layer.layer_id in self.disable_value_layer_ids
+        cp_active = is_cp_v2_active(forward_batch)
+        if cp_active:
+            if not self.enable_query_sharded_cp:
+                raise RuntimeError(
+                    "MiniMax prefill CP is experimental; set "
+                    "SGLANG_OPT_USE_MINIMAX_QUERY_SHARDED_CP=1 to enable the "
+                    "query-sharded full-KV path"
+                )
+            if self.is_npu:
+                raise RuntimeError(
+                    "MiniMax query-sharded CP is currently implemented only for CUDA/HIP"
+                )
+            k, v, idx_k, idx_v = self._materialize_query_sharded_cp_kv(
+                forward_batch, k, v, idx_k, idx_v
+            )
+            global _minimax_sparse_cp_logged
+            if not _minimax_sparse_cp_logged:
+                logger.info(
+                    "MiniMax query-sharded sparse PCP selected: strategy=zigzag, "
+                    "cp_size=%s, local_q=%s, materialized_kv=%s",
+                    get_cp_strategy().cp_size,
+                    q.shape[0],
+                    k.shape[0],
+                )
+                _minimax_sparse_cp_logged = True
         kv_cached_by_fusion = self._is_sparse_kv_cached_by_fusion(
             forward_batch, layer.layer_id
         )
-        if not kv_cached_by_fusion:
+        # A fused QKNorm/RoPE projection can only have stored this CP rank's
+        # local token rows.  Query-sharded MiniMax CP needs every rank to own
+        # the complete new-chunk sparse KV, so overwrite that partial write
+        # with the globally materialized tensors.
+        store_loc, dcp_kv_mask = self._cache_store_loc_and_mask(forward_batch)
+        if self.dcp_size > 1 or cp_active or not kv_cached_by_fusion:
             self.kv_pool.set_fused_kv_index_buffer(
                 layer,
-                forward_batch.out_cache_loc,
+                store_loc,
                 k,
                 v,
                 idx_k,
@@ -1338,6 +1605,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 layer.v_scale_float,
                 layer.idx_k_scale_float,
                 layer.idx_v_scale_float,
+                dcp_kv_mask=dcp_kv_mask,
             )
         k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
         if disable_value:
@@ -1349,7 +1617,16 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         cu_seqlens, seq_lens, prefix_lens = self._resolve_extend_meta(forward_batch, q)
 
         # DP attention pads q beyond real tokens; trim (CPU list avoids a sync).
-        if forward_batch.extend_seq_lens_cpu is not None:
+        if cp_active:
+            cp_meta = forward_batch.attn_cp_metadata
+            # CP-v2 rewrites per_rank_actual_token to the collective-aligned
+            # physical row count.  Sparse attention metadata describes only
+            # logical queries, so trim padding with the preserved logical list.
+            per_rank_tokens = (
+                cp_meta.per_rank_logical_token or cp_meta.per_rank_actual_token
+            )
+            actual_num_tokens = int(per_rank_tokens[get_cp_strategy().cp_rank])
+        elif forward_batch.extend_seq_lens_cpu is not None:
             actual_num_tokens = int(sum(forward_batch.extend_seq_lens_cpu))
         else:
             actual_num_tokens = int(cu_seqlens[-1].item())
@@ -1397,38 +1674,213 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 minimax_sparse_prefill,
             )
 
-            idx_o, o = minimax_sparse_prefill(
-                q,
-                k_cache,
-                v_cache,
-                None,
-                idx_q,
-                idx_k_cache,
-                idx_v_cache,
-                None,
-                self.req_to_token,
-                forward_batch.req_pool_indices,
-                cu_seqlens,
-                seq_lens,
-                prefix_lens,
-                self._max_seqlen_q,
-                self._max_seqlen_k,
-                self.block_size_q,
-                self.block_size_k,
-                self.topk_blocks,
-                self.init_blocks,
-                self.local_blocks,
-                score_type=self.score_type,
-                disable_index_value=disable_value,
-                use_msa=self.use_msa,
-                seqlens_cpu=forward_batch.extend_seq_lens_cpu,
-                q_scale=layer.q_scale_float,
-                k_scale=layer.k_scale_float,
-                v_scale=layer.v_scale_float,
-                idx_q_scale=layer.idx_q_scale_float,
-                idx_k_scale=layer.idx_k_scale_float,
-                idx_v_scale=layer.idx_v_scale_float,
+            effective_block_size_q = self._select_gpu_prefill_block_size_q()
+            # Query-sharded CP rewrites tensor shapes and backend max lengths
+            # to rank-local values.  The scheduler's CPU list remains in the
+            # original request domain (128K seed versus 16K cache-hit extend),
+            # which is the domain used by exact-grouped-main policy bounds.
+            logical_max_seqlen_q = max(
+                forward_batch.extend_seq_lens_cpu or [self._max_seqlen_q]
             )
+
+            def run_sparse_segment(
+                segment_q,
+                segment_idx_q,
+                segment_cu_seqlens,
+                segment_seq_lens,
+                segment_prefix_lens,
+                segment_q_lens_cpu,
+                segment_max_q,
+                segment_max_k,
+                segment_slot_ids=None,
+            ):
+                return minimax_sparse_prefill(
+                    segment_q,
+                    k_cache,
+                    v_cache,
+                    None,
+                    segment_idx_q,
+                    idx_k_cache,
+                    idx_v_cache,
+                    None,
+                    self.req_to_token,
+                    (
+                        forward_batch.req_pool_indices
+                        if segment_slot_ids is None
+                        else segment_slot_ids
+                    ),
+                    segment_cu_seqlens,
+                    segment_seq_lens,
+                    segment_prefix_lens,
+                    segment_max_q,
+                    segment_max_k,
+                    effective_block_size_q,
+                    self.block_size_k,
+                    self.topk_blocks,
+                    self.init_blocks,
+                    self.local_blocks,
+                    score_type=self.score_type,
+                    disable_index_value=disable_value,
+                    use_msa=self.use_msa,
+                    seqlens_cpu=segment_q_lens_cpu,
+                    q_scale=layer.q_scale_float,
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                    idx_q_scale=layer.idx_q_scale_float,
+                    idx_k_scale=layer.idx_k_scale_float,
+                    idx_v_scale=layer.idx_v_scale_float,
+                    dcp_size=self.dcp_size,
+                    dcp_rank=self.dcp_rank,
+                    dcp_group=self.dcp_group,
+                    logical_max_seqlen_q=logical_max_seqlen_q,
+                )
+
+            if cp_active:
+                cp_meta = forward_batch.attn_cp_metadata
+                split_at = cp_meta.total_q_prev_tokens
+                if os.environ.get("SGLANG_MINIMAX_COMBINE_CP_SEGMENTS", "0") == "1":
+                    # The local tensor is already laid out as all early zigzag
+                    # slices followed by all late slices.  Treat those slices
+                    # as one 2*batch ragged launch: attention programs remain
+                    # request-independent, while score/Top-K/union/main launch
+                    # count and the two output cat kernels are halved.
+                    combined_cu = torch.cat(
+                        [
+                            cp_meta.cu_seqlens_q_prev_tensor,
+                            cp_meta.cu_seqlens_q_next_tensor[1:] + split_at,
+                        ]
+                    )
+                    combined_seq_lens = torch.cat(
+                        [cp_meta.kv_len_prev_tensor, cp_meta.kv_len_next_tensor]
+                    )
+                    combined_q_lens = torch.cat(
+                        [
+                            cp_meta.actual_seq_q_prev_tensor,
+                            cp_meta.actual_seq_q_next_tensor,
+                        ]
+                    )
+                    combined_slots = torch.cat(
+                        [
+                            forward_batch.req_pool_indices,
+                            forward_batch.req_pool_indices,
+                        ]
+                    )
+                    combined_q_lens_cpu = (
+                        cp_meta.actual_seq_q_prev_list
+                        + cp_meta.actual_seq_q_next_list
+                    )
+                    idx_o, o = run_sparse_segment(
+                        q[:actual_num_tokens],
+                        idx_q[:actual_num_tokens],
+                        combined_cu,
+                        combined_seq_lens,
+                        combined_seq_lens - combined_q_lens,
+                        combined_q_lens_cpu,
+                        max(
+                            cp_meta.max_seqlen_q_prev,
+                            cp_meta.max_seqlen_q_next,
+                        ),
+                        max(
+                            cp_meta.kv_len_prev_list
+                            + cp_meta.kv_len_next_list,
+                            default=0,
+                        ),
+                        combined_slots,
+                    )
+                else:
+                    segment_specs = (
+                        (
+                            q[:split_at],
+                            idx_q[:split_at],
+                            cp_meta.cu_seqlens_q_prev_tensor,
+                            cp_meta.kv_len_prev_tensor,
+                            cp_meta.actual_seq_q_prev_tensor,
+                            cp_meta.actual_seq_q_prev_list,
+                            cp_meta.max_seqlen_q_prev,
+                            cp_meta.kv_len_prev_list,
+                        ),
+                        (
+                            q[split_at:actual_num_tokens],
+                            idx_q[split_at:actual_num_tokens],
+                            cp_meta.cu_seqlens_q_next_tensor,
+                            cp_meta.kv_len_next_tensor,
+                            cp_meta.actual_seq_q_next_tensor,
+                            cp_meta.actual_seq_q_next_list,
+                            cp_meta.max_seqlen_q_next,
+                            cp_meta.kv_len_next_list,
+                        ),
+                    )
+
+                    def launch_segment(spec):
+                        (
+                            segment_q,
+                            segment_idx_q,
+                            segment_cu,
+                            segment_kv_lens,
+                            segment_q_lens,
+                            q_lens_cpu,
+                            max_q,
+                            kv_lens_cpu,
+                        ) = spec
+                        return run_sparse_segment(
+                            segment_q,
+                            segment_idx_q,
+                            segment_cu,
+                            segment_kv_lens,
+                            segment_kv_lens - segment_q_lens,
+                            q_lens_cpu,
+                            max_q,
+                            max(kv_lens_cpu, default=0),
+                        )
+
+                    segment_outputs = []
+                    if (
+                        os.environ.get(
+                            "SGLANG_MINIMAX_PARALLEL_CP_SEGMENTS", "0"
+                        )
+                        == "1"
+                    ):
+                        # Keep the two zigzag segments as independent ragged
+                        # batches (the exact numerical contract), but submit
+                        # them to separate streams.  A single batch-1 score
+                        # grid under-fills gfx938; concurrent grids recover
+                        # occupancy without changing sequence metadata.
+                        current_stream = torch.cuda.current_stream(q.device)
+                        streams = getattr(self, "_minimax_cp_segment_streams", None)
+                        if streams is None:
+                            streams = tuple(
+                                torch.cuda.Stream(device=q.device) for _ in range(2)
+                            )
+                            self._minimax_cp_segment_streams = streams
+                        for stream in streams:
+                            stream.wait_stream(current_stream)
+                        for spec, stream in zip(segment_specs, streams):
+                            with torch.cuda.stream(stream):
+                                segment_outputs.append(launch_segment(spec))
+                        for stream in streams:
+                            current_stream.wait_stream(stream)
+                    else:
+                        segment_outputs = [
+                            launch_segment(spec) for spec in segment_specs
+                        ]
+                    idx_parts, out_parts = zip(*segment_outputs)
+                    idx_o = (
+                        None
+                        if any(part is None for part in idx_parts)
+                        else torch.cat(idx_parts, dim=0)
+                    )
+                    o = torch.cat(out_parts, dim=0)
+            else:
+                idx_o, o = run_sparse_segment(
+                    q,
+                    idx_q,
+                    cu_seqlens,
+                    seq_lens,
+                    prefix_lens,
+                    forward_batch.extend_seq_lens_cpu or [q.shape[0]],
+                    self._max_seqlen_q,
+                    self._max_seqlen_k,
+                )
         if actual_num_tokens < original_num_tokens:
             pad_len = original_num_tokens - actual_num_tokens
             o = torch.cat([o, o.new_zeros(pad_len, *o.shape[1:])], dim=0)
@@ -1498,9 +1950,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ):
         assert len(kwargs) == 0
         disable_value = layer.layer_id in self.disable_value_layer_ids
+        store_loc, dcp_kv_mask = self._cache_store_loc_and_mask(forward_batch)
         self.kv_pool.set_fused_kv_index_buffer(
             layer,
-            forward_batch.out_cache_loc,
+            store_loc,
             k,
             v,
             idx_k,
@@ -1509,6 +1962,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             layer.v_scale_float,
             layer.idx_k_scale_float,
             layer.idx_v_scale_float,
+            dcp_kv_mask=dcp_kv_mask,
         )
         k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
         if disable_value:
@@ -1595,6 +2049,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 idx_q_scale=layer.idx_q_scale_float,
                 idx_k_scale=layer.idx_k_scale_float,
                 idx_v_scale=layer.idx_v_scale_float,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
+                dcp_group=self.dcp_group,
             )
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
@@ -1614,6 +2071,19 @@ class MiniMaxHybridAttnBackend(AttentionBackend):
         self.dense = dense_backend
         self.sparse = sparse_backend
         self.sparse_layer_ids = sparse_layer_ids
+        # CP strategies obtain the active KV pool through get_attn_backend().
+        # Expose the shared runner pool on this outer hybrid wrapper just like
+        # HybridAttnBackend does.  Silently forwarding different child pools
+        # would make CP materialize dense-layer KV into the wrong cache.
+        dense_kv_pool = getattr(dense_backend, "token_to_kv_pool", None)
+        sparse_kv_pool = sparse_backend.token_to_kv_pool
+        if dense_kv_pool is not None and dense_kv_pool is not sparse_kv_pool:
+            raise RuntimeError(
+                "MiniMax dense and sparse attention backends must share the "
+                "same token_to_kv_pool"
+            )
+        self.token_to_kv_pool = sparse_kv_pool
+        self.req_to_token_pool = getattr(dense_backend, "req_to_token_pool", None)
         # Let the sparse decode reuse the dense paged backend (page table + workspace).
         self.sparse.dense_backend = dense_backend
         self.extend_dummy_seqs_capped_by_req_pool = getattr(

@@ -953,6 +953,28 @@ def dp_reduce_scatterv_async(
     return ev
 
 
+def dp_reduce_scatter_tensor_async(
+    output_local: torch.Tensor,
+    global_tokens: torch.Tensor,
+    event_key=("combine_tensor", 0),
+) -> torch.cuda.Event:
+    """Launch the regular DP reduce-scatter combine on the TBO comm stream.
+
+    Unlike ``dp_reduce_scatterv_async``, this supports the MAX_LEN CUDA-graph
+    layout and hybrid attention-TP layouts.  In the latter case
+    ``dp_reduce_scatter_tensor`` performs the TP reduce-scatter followed by the
+    attention-TP all-gather needed to reconstruct TP_ATTN_FULL.
+    """
+    comm = get_dp_tbo_comm_stream()
+    compute = torch.cuda.current_stream()
+    ev = _tbo_event(event_key)
+    with torch.cuda.stream(comm):
+        comm.wait_stream(compute)
+        dp_reduce_scatter_tensor(output_local, global_tokens)
+        ev.record(comm)
+    return ev
+
+
 def attn_tp_reduce_scatter_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attn_tp_group().reduce_scatter_tensor(output, input)
 

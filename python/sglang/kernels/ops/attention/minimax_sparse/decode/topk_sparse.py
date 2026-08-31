@@ -1,6 +1,6 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
-from typing import Optional
+from typing import Optional, Tuple, Union
 
 import torch
 import triton
@@ -89,6 +89,8 @@ def _gqa_share_sparse_decode_kernel(
     NUM_TOPK_CHUNKS: tl.constexpr,
     HAS_SINK: tl.constexpr,
     IS_FP8: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
 ):
     # decode program ids: split-K over the topk dimension to give every SM
     # something to do at small batch. pid(0) folds (batch, chunk) together so
@@ -173,6 +175,9 @@ def _gqa_share_sparse_decode_kernel(
             mask=pos_mask,
             other=0,
         ).to(tl.int64)
+        if DCP_SIZE > 1:
+            pos_mask = pos_mask & (pos % DCP_SIZE == DCP_RANK)
+            slots = slots // DCP_SIZE
         slots = (slots + max_slots) % max_slots  # safety against negative
         # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
         k_off = (
@@ -212,22 +217,44 @@ def _gqa_share_sparse_decode_kernel(
             v = v.to(q.dtype)
         # compute qk
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
-        qk += tl.where(off_n[None, :] < seq_len - c, 0, float("-inf"))
+        if DCP_SIZE > 1:
+            qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+        else:
+            qk += tl.where(off_n[None, :] < seq_len - c, 0, float("-inf"))
         # [H, D], [D, N] -> [H, N]
         qk += tl.dot(q, k) * (sm_scale * k_scale)
         # compute m_ij and l_ij
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.exp(qk - m_ij[:, None])
+        if DCP_SIZE > 1:
+            has_value = m_ij > float("-inf")
+            safe_m_ij = tl.where(has_value, m_ij, 0.0)
+            p = tl.where(
+                qk > float("-inf"), tl.exp(qk - safe_m_ij[:, None]), 0.0
+            )
+            acc_o_scale = tl.where(
+                m_i > float("-inf"), tl.exp(m_i - safe_m_ij), 0.0
+            )
+        else:
+            p = tl.exp(qk - m_ij[:, None])
+            acc_o_scale = tl.exp(m_i - m_ij)
         l_ij = tl.sum(p, axis=1)
         # scale acc_o
-        acc_o_scale = tl.exp(m_i - m_ij)
         acc_o = acc_o * acc_o_scale[:, None]
         # load v and update acc_o
         # [H, N], [N, D] -> [H, D]
         acc_o += tl.dot(p.to(v.dtype), v) * v_scale
         # update statistics
-        m_i = m_ij
-        lse_i = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
+        if DCP_SIZE > 1:
+            lse_sum = tl.where(
+                lse_i > float("-inf"), tl.exp(lse_i - safe_m_ij), 0.0
+            ) + l_ij
+            m_i = tl.where(has_value, m_ij, float("-inf"))
+            lse_i = tl.where(
+                has_value, safe_m_ij + tl.log(lse_sum), float("-inf")
+            )
+        else:
+            m_i = m_ij
+            lse_i = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
     # final scale (matches the old non-split kernel for chunks where lse_i>-inf).
     # For empty chunks (chunk_start_topk >= real_topk) the inner loop never
     # runs, so m_i = lse_i = -inf and naive `tl.exp(m_i - lse_i)` would compute
@@ -298,11 +325,21 @@ def _merge_topk_attn_out_kernel(
     # standard flash-decoding merge in linear (not log2) space, matching the
     # decode kernel which uses tl.exp / tl.log.
     lse_max = tl.max(lse, axis=0)
-    weights = tl.exp(lse - lse_max)
-    weights = weights / tl.sum(weights, axis=0)
+    has_value = lse_max > float("-inf")
+    safe_lse_max = tl.where(has_value, lse_max, 0.0)
+    weights = tl.where(has_value, tl.exp(lse - safe_lse_max), 0.0)
+    weight_sum = tl.sum(weights, axis=0)
+    weights = tl.where(has_value, weights / weight_sum, 0.0)
     o_merged = tl.sum(o * weights[:, None], axis=0)
     o_out_ptrs = o_ptr + pid_b * stride_o_b + pid_h * stride_o_h + off_d * stride_o_d
     tl.store(o_out_ptrs, o_merged.to(o_ptr.dtype.element_ty), mask=off_d < head_dim)
+    # Preserve the merged natural-log LSE in chunk zero for optional DCP
+    # cross-rank output merging. Existing callers that only consume O are
+    # unchanged.
+    tl.store(
+        lse_ptr + pid_b * stride_l_b + pid_h * stride_l_h,
+        tl.where(has_value, safe_lse_max + tl.log(weight_sum), float("-inf")),
+    )
 
 
 @torch.no_grad()
@@ -321,7 +358,10 @@ def flash_decode_with_gqa_share_sparse(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
-) -> torch.Tensor:
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="decode")
     k_scale = unit_scale(k_scale)
@@ -420,6 +460,8 @@ def flash_decode_with_gqa_share_sparse(
         BLOCK_SIZE_N=block_size,
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
         IS_FP8=is_fp8,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
     )
     # merge partials into chunk 0
     merge_grid = (batch_size, num_q_heads)
@@ -436,4 +478,7 @@ def flash_decode_with_gqa_share_sparse(
         lse_partial.stride(2),
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
     )
-    return o_partial[0].contiguous()
+    output = o_partial[0].contiguous()
+    if return_lse:
+        return output, lse_partial[0].contiguous()
+    return output

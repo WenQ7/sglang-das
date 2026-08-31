@@ -5252,6 +5252,23 @@ class ServerArgs:
         hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
 
+        if (
+            model_arch
+            in (
+                "MiniMaxM3SparseForCausalLM",
+                "MiniMaxM3SparseForConditionalGeneration",
+            )
+            and self.dcp_size > 1
+            and os.environ.get("SGLANG_OPT_USE_MINIMAX_DCP2", "0")
+            not in ("1", "true", "True")
+        ):
+            raise ValueError(
+                "MiniMax-M3 sparse DCP is experimental and disabled by default. "
+                "Use --dcp-size 1, or explicitly set "
+                "SGLANG_OPT_USE_MINIMAX_DCP2=1 with --dcp-size 2 to exercise "
+                "the DCP-masked KV, distributed exact TopK, and O/LSE merge path."
+            )
+
         if model_arch == "InternS2MobiusForConditionalGeneration":
             unsupported = []
             if self.pp_size != 1:
@@ -6590,9 +6607,22 @@ class ServerArgs:
             ), "Aiter allreduce fusion is not supported with context parallelism"
 
         if view.attn_cp_size != self.moe_dp_size:
-            assert (
-                self.moe_dp_size == 1
-            ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+            # DP attention and MoE-DP may use the same DP partition while CP is
+            # disabled.  In that layout (EP=1, attn-DP == MoE-DP), attention TP
+            # and MoE TP are identical contiguous rank groups, so no CP token
+            # sharing is required.  The former blanket assertion rejected this
+            # valid and communication-efficient layout.
+            moe_dp_matches_attn_dp = (
+                self.enable_dp_attention
+                and view.attn_cp_size == 1
+                and self.moe_dp_size == self.dp_size
+                and view.ep_size == 1
+            )
+            assert self.moe_dp_size == 1 or moe_dp_matches_attn_dp, (
+                "attn_cp_size != moe_dp_size requires moe_dp_size == 1, or "
+                "the aligned DP-attention layout: attn_cp_size=1, ep_size=1, "
+                "and moe_dp_size=dp_size"
+            )
 
         from sglang.srt.layers.cp.base import init_cp_strategy
 

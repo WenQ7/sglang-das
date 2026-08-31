@@ -16,6 +16,7 @@
 """Inference-only MiniMax M3 model compatible with HuggingFace weights."""
 
 import logging
+import os
 from contextlib import nullcontext
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
@@ -30,6 +31,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed import (
     get_pp_group,
+    moe_tensor_model_parallel_all_reduce,
     tensor_model_parallel_all_reduce,
 )
 from sglang.srt.environ import envs
@@ -43,6 +45,11 @@ from sglang.srt.layers.communicator import (
     enable_moe_dense_fully_dp,
 )
 from sglang.srt.layers.dp_attention import (
+    _tbo_event,
+    dp_gather_partial,
+    dp_reduce_scatter_tensor_async,
+    get_dp_tbo_comm_stream,
+    get_tbo_persistent_buffer,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
@@ -65,6 +72,7 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.utils.common import get_layer_id
+from sglang.srt.layers.utils.cp_utils import is_prefill_context_parallel_enabled
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -74,7 +82,11 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import (
+    ForwardBatch,
+    ForwardMode,
+    PPProxyTensors,
+)
 from sglang.srt.model_executor.forward_context import (
     get_forward_context,
     has_forward_context,
@@ -89,6 +101,7 @@ from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
     add_prefix,
+    get_bool_env_var,
     get_device_sm,
     is_cuda,
     is_hip,
@@ -102,6 +115,44 @@ _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _device_sm = get_device_sm()
+
+# MiniMax-M3 channel-FP8 checkpoints launch qkv_proj and index_qkv_proj with
+# the same input on every sparse-attention layer.  LightOp keeps both weights
+# in the checkpoint's [N, K] OCP-E4M3 layout, so concatenating their output
+# rows (and per-channel scales) is lossless and lets one larger GEMM replace
+# two smaller GEMMs plus one duplicate activation-quantization pass.
+_fuse_lightop_channel_fp8_qkv_index = (
+    _is_hip
+    and get_bool_env_var("SGLANG_USE_LIGHTOP_CHANNEL_FP8")
+    and get_bool_env_var(
+        "SGLANG_OPT_USE_MINIMAX_FUSED_CHANNEL_FP8_QKV_INDEX", default="true"
+    )
+)
+
+# The generic HIP BF16->FP32 GEMM is disproportionately expensive for the
+# decode router shape [M, 6144] x [128, 6144]^T (M <= 16). Keep the
+# specialized GEMV opt-in at framework level; the MiniMax performance script
+# enables it and the sweep audits its first runtime hit.
+_use_minimax_router_gemv = _is_hip and get_bool_env_var(
+    "SGLANG_OPT_USE_MINIMAX_ROUTER_GEMV", default="false"
+)
+_minimax_router_gemv_block_k = int(
+    os.environ.get("SGLANG_MINIMAX_ROUTER_GEMV_BLOCK_K", "256")
+)
+_minimax_router_gemv_num_warps = int(
+    os.environ.get("SGLANG_MINIMAX_ROUTER_GEMV_NUM_WARPS", "4")
+)
+_minimax_router_gemv_logged = False
+if _use_minimax_router_gemv:
+    from sglang.kernels.ops.moe.minimax_router_gemv import (
+        can_use_minimax_router_gemv as _can_use_minimax_router_gemv,
+    )
+    from sglang.kernels.ops.moe.minimax_router_gemv import (
+        minimax_router_gemv as _minimax_router_gemv,
+    )
+else:
+    _can_use_minimax_router_gemv = None
+    _minimax_router_gemv = None
 
 _FP8_KV_DTYPES = (
     torch.float8_e4m3fn,
@@ -194,6 +245,8 @@ class _FusedQKVIndexProj(nn.Module):
         quant_method,
         weight: torch.Tensor,
         weight_scale_inv: Optional[torch.Tensor],
+        weight_scale: Optional[torch.Tensor],
+        scheme,
         input_size_per_partition: int,
         logical_widths: List[int],
         orig_dtype: torch.dtype,
@@ -208,6 +261,9 @@ class _FusedQKVIndexProj(nn.Module):
         self.logical_widths = logical_widths
         self.orig_dtype = orig_dtype
         self.input_scale = None
+        # CompressedTensorsLinearMethod.apply() dispatches through layer.scheme.
+        # MXFP8 and unquantized methods do not use it.
+        self.scheme = scheme
         if weight_scale_inv is not None:
             self.register_parameter(
                 "weight_scale_inv", nn.Parameter(weight_scale_inv, requires_grad=False)
@@ -216,15 +272,25 @@ class _FusedQKVIndexProj(nn.Module):
             # Must derive the backend scale layout here: the loader skips this
             # module (see ``_qm``), so it won't run process_weights_after_loading.
             quant_method._process_mxfp8_linear_weight_scale(self)
+        if weight_scale is not None:
+            self.register_parameter(
+                "weight_scale", nn.Parameter(weight_scale, requires_grad=False)
+            )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self._qm.apply(self, x, None)
 
 
 def build_minimax_fused_qkv_index(model: nn.Module) -> None:
+    fused_count = 0
     for module in model.modules():
         if isinstance(module, MiniMaxM3Attention):
-            module.maybe_build_fused_qkv_index()
+            fused_count += int(module.maybe_build_fused_qkv_index())
+    if fused_count:
+        log_info_on_rank0(
+            logger,
+            f"MiniMax fused qkv+index projection enabled on {fused_count} sparse layers.",
+        )
 
 
 class MiniMaxM3MLP(nn.Module):
@@ -317,7 +383,22 @@ class MiniMaxM3MoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.tp_size = get_parallel().tp_size
+        parallel = get_parallel()
+        # Standard EP's routed experts are partitioned across EP and MoE-TP,
+        # while the unfused shared expert remains sharded once over the complete
+        # model-TP group.  Its final global-TP reduction combines both axes
+        # without replicating the shared contribution.  By contrast, EP1 +
+        # MoE-DP uses matching attention/MoE-TP groups and must not fall back to
+        # global TP, or it would reintroduce the layout conversion we are trying
+        # to remove.
+        self.reduce_over_global_tp = (
+            parallel.moe_ep_size > 1 and get_moe_a2a_backend().is_none()
+        )
+        self.tp_size = (
+            parallel.tp_size
+            if self.reduce_over_global_tp
+            else parallel.moe_tp_size
+        )
         self.alt_stream = alt_stream
         self.n_shared_experts = getattr(config, "n_shared_experts", None)
         self.num_fused_shared_experts = (
@@ -375,13 +456,25 @@ class MiniMaxM3MoE(nn.Module):
             # DeepEP all-gathers (not all-reduces) the layer output, so a TP-sharded
             # shared MLP would leave an unreduced partial; replicate (tp_size=1), like GLM4 / DSV2.
             shared_experts_tp1 = get_moe_a2a_backend().is_deepep()
+            if shared_experts_tp1:
+                shared_experts_tp = dict(tp_rank=0, tp_size=1)
+            elif self.reduce_over_global_tp:
+                shared_experts_tp = dict(
+                    tp_rank=parallel.tp_rank,
+                    tp_size=parallel.tp_size,
+                )
+            else:
+                shared_experts_tp = dict(
+                    tp_rank=parallel.moe_tp_rank,
+                    tp_size=parallel.moe_tp_size,
+                )
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("shared_experts", prefix),
                 reduce_results=False,
                 intermediate_size=intermediate_size,
-                **(dict(tp_rank=0, tp_size=1) if shared_experts_tp1 else {}),
+                **shared_experts_tp,
             )
         else:
             self.shared_experts = None
@@ -450,7 +543,14 @@ class MiniMaxM3MoE(nn.Module):
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
         if self.tp_size > 1 and not should_allreduce_fusion and not use_reduce_scatter:
-            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if self.reduce_over_global_tp:
+                final_hidden_states = tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
+            else:
+                final_hidden_states = moe_tensor_model_parallel_all_reduce(
+                    final_hidden_states
+                )
 
         return final_hidden_states
 
@@ -503,6 +603,29 @@ class MiniMaxM3MoE(nn.Module):
 
     def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.bf16_router_gemm:
+            if _can_use_minimax_router_gemv is not None:
+                if _can_use_minimax_router_gemv(
+                    hidden_states, self.gate.weight
+                ):
+                    assert _minimax_router_gemv is not None
+                    global _minimax_router_gemv_logged
+                    if not _minimax_router_gemv_logged:
+                        logger.info(
+                            "MiniMax router GEMV selected: M=%s, N=%s, K=%s, "
+                            "block_k=%s, num_warps=%s",
+                            hidden_states.shape[0],
+                            self.gate.weight.shape[0],
+                            hidden_states.shape[1],
+                            _minimax_router_gemv_block_k,
+                            _minimax_router_gemv_num_warps,
+                        )
+                        _minimax_router_gemv_logged = True
+                    return _minimax_router_gemv(
+                        hidden_states,
+                        self.gate.weight,
+                        block_k=_minimax_router_gemv_block_k,
+                        num_warps=_minimax_router_gemv_num_warps,
+                    )
             if _is_npu:
                 # NPU lacks aten::mm.dtype; bf16 mm then cast keeps topk semantics.
                 return torch.mm(hidden_states, self.gate.weight.t()).float()
@@ -877,38 +1000,65 @@ class MiniMaxM3Attention(nn.Module):
             )
         return idx_q, idx_k, idx_v
 
-    def maybe_build_fused_qkv_index(self) -> None:
+    def maybe_build_fused_qkv_index(self) -> bool:
         if not self._fuse_qkv_index_enabled or self._fused_qkv_index is not None:
-            return
+            return False
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         qp, ip = self.qkv_proj, self.index_qkv_proj
         qm = qp.quant_method
         if type(ip.quant_method) is not type(qm):
-            return
+            return False
 
         # gfx942 converts MXFP8->block-fp8 in process_weights_after_loading; the
         # fused module skips that pass, so keep two separate (converted) GEMMs.
         if getattr(qm, "convert_mxfp8_to_block", False):
-            return
+            return False
 
         is_unquant = isinstance(qm, UnquantizedLinearMethod)
         use_mxfp8 = getattr(qm, "use_mxfp8", False) and hasattr(qp, "weight_scale_inv")
-        if not (is_unquant or use_mxfp8):
-            return
+        qp_scheme = getattr(qp, "scheme", None)
+        ip_scheme = getattr(ip, "scheme", None)
+        strategy = getattr(qp_scheme, "strategy", None)
+        strategy_name = getattr(strategy, "value", strategy)
+        use_lightop_channel_fp8 = (
+            _fuse_lightop_channel_fp8_qkv_index
+            and qp_scheme is not None
+            and type(ip_scheme) is type(qp_scheme)
+            and strategy_name == "channel"
+            and getattr(qp_scheme, "is_static_input_scheme", True) is False
+            and getattr(ip_scheme, "is_static_input_scheme", True) is False
+            and hasattr(qp, "weight_scale")
+            and hasattr(ip, "weight_scale")
+            and getattr(qp, "input_scale", None) is None
+            and getattr(ip, "input_scale", None) is None
+        )
+        if not (is_unquant or use_mxfp8 or use_lightop_channel_fp8):
+            return False
 
         weight = torch.cat([qp.weight.data, ip.weight.data], dim=0).contiguous()
         if is_unquant:
-            scale = None
+            scale_inv = None
         else:
-            scale = torch.cat(
-                [qp.weight_scale_inv.data, ip.weight_scale_inv.data], dim=0
-            ).contiguous()
+            scale_inv = (
+                torch.cat(
+                    [qp.weight_scale_inv.data, ip.weight_scale_inv.data], dim=0
+                ).contiguous()
+                if use_mxfp8
+                else None
+            )
+        weight_scale = (
+            torch.cat([qp.weight_scale.data, ip.weight_scale.data], dim=0).contiguous()
+            if use_lightop_channel_fp8
+            else None
+        )
 
         holder = _FusedQKVIndexProj(
             qm,
             weight,
-            scale,
+            scale_inv,
+            weight_scale,
+            qp_scheme if use_lightop_channel_fp8 else None,
             getattr(qp, "input_size_per_partition", qp.input_size),
             [qp.output_size_per_partition, ip.output_size_per_partition],
             getattr(qp, "orig_dtype", qp.params_dtype),
@@ -920,10 +1070,11 @@ class MiniMaxM3Attention(nn.Module):
         # post-process loop ignores them (see ``_qm``).
         for m in (qp, ip):
             m.quant_method = None
-            for attr in ("weight", "weight_scale_inv"):
+            for attr in ("weight", "weight_scale_inv", "weight_scale"):
                 p = getattr(m, attr, None)
                 if isinstance(p, nn.Parameter):
                     p.data = torch.empty(0, dtype=p.dtype, device=p.data.device)
+        return True
 
     def _qknorm_groups(self):
         weights = (
@@ -1021,6 +1172,12 @@ class MiniMaxM3Attention(nn.Module):
         main_kv_is_fp8 = kv_pool is not None and kv_pool.dtype in _FP8_KV_DTYPES
         can_use_cache_fusion = (
             not main_kv_is_fp8
+            # DCP translates virtual slots to local physical slots and masks
+            # token ownership. The current fused norm/RoPE/cache-store kernel
+            # accepts neither translation nor a mask, so let the sparse backend
+            # perform the DCP-aware store instead.
+            and not get_parallel().dcp_enabled
+            and not is_prefill_context_parallel_enabled()
             and idx_v is None
             and self._can_use_rocm_sparse_qk_index_norm_rope(
                 positions, q, k, idx_q, idx_k
@@ -1034,29 +1191,35 @@ class MiniMaxM3Attention(nn.Module):
             layer_id = self.attn.layer_id
             k_cache, v_cache = kv_pool.get_kv_buffer(layer_id)
             idx_k_cache = kv_pool.get_index_k_buffer(layer_id)
-            q, k, idx_q, idx_k = sparse_qk_index_gemma_rmsnorm_rope_cache(
-                q,
-                k,
-                v,
-                idx_q,
-                idx_k,
-                k_cache,
-                v_cache,
-                idx_k_cache,
-                forward_batch.out_cache_loc,
-                self.q_norm.weight.data,
-                self.k_norm.weight.data,
-                self.index_q_norm.weight.data,
-                self.index_k_norm.weight.data,
-                positions,
-                self.rotary_emb.cos_sin_cache,
-                self.q_norm.variance_epsilon,
-                self.head_dim,
-                self.rotary_dim,
-                self.rotary_emb.is_neox_style,
-            )
-            self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
-            return q, k, idx_q, idx_k
+            # The fused store currently addresses caches as [slot, head, dim].
+            # Some backends (notably HCU/gfx938 Triton attention) expose paged
+            # buffers as [page, page_size, head, dim]. Let the attention backend
+            # perform its normal cache store for those layouts instead of passing
+            # incompatible strides to the fusion.
+            if k_cache.dim() == v_cache.dim() == idx_k_cache.dim() == 3:
+                q, k, idx_q, idx_k = sparse_qk_index_gemma_rmsnorm_rope_cache(
+                    q,
+                    k,
+                    v,
+                    idx_q,
+                    idx_k,
+                    k_cache,
+                    v_cache,
+                    idx_k_cache,
+                    forward_batch.out_cache_loc,
+                    self.q_norm.weight.data,
+                    self.k_norm.weight.data,
+                    self.index_q_norm.weight.data,
+                    self.index_k_norm.weight.data,
+                    positions,
+                    self.rotary_emb.cos_sin_cache,
+                    self.q_norm.variance_epsilon,
+                    self.head_dim,
+                    self.rotary_dim,
+                    self.rotary_emb.is_neox_style,
+                )
+                self._mark_sparse_kv_cached_by_fusion(forward_batch, layer_id)
+                return q, k, idx_q, idx_k
         return self._sparse_qk_index_norm_rope(positions, q, k, idx_q, idx_k)
 
     def forward_prepare_npu(
@@ -1244,6 +1407,19 @@ class MiniMaxM3Attention(nn.Module):
             )
         return self.forward_core(s)
 
+    def op_prepare(self, state):
+        prepare = self.forward_prepare_npu if _is_npu else self.forward_prepare
+        state.attn_intermediate_state = prepare(
+            positions=state.positions,
+            hidden_states=state.pop("hidden_states_after_comm_pre_attn"),
+            forward_batch=state.forward_batch,
+        )
+
+    def op_core(self, state):
+        state.hidden_states_after_attn = self.forward_core(
+            state.pop("attn_intermediate_state")
+        )
+
 
 class MiniMaxM3DecoderLayer(nn.Module):
     def __init__(
@@ -1407,6 +1583,137 @@ class MiniMaxM3DecoderLayer(nn.Module):
 
         return hidden_states, residual
 
+    # TBO operations for the non-EP DP-attention + TP-MoE path.  The two
+    # expensive layout collectives are launched on a dedicated communication
+    # stream; YieldOperation lets the other micro-batch compute while they run.
+    def op_comm_prepare_attn(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator=None,
+        tbo_subbatch_index: Optional[int] = None,
+    ):
+        state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
+            self.layer_communicator.prepare_attn(
+                hidden_states, residual, forward_batch
+            )
+        )
+        state.update(
+            dict(
+                positions=positions,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                tbo_subbatch_index=tbo_subbatch_index,
+            )
+        )
+
+    def op_gather_a(self, state):
+        parallel = get_parallel()
+        if not (
+            is_dp_attention_enabled()
+            and parallel.moe_ep_size == 1
+            and parallel.moe_dp_size == 1
+            and self.layer_scatter_modes.mlp_mode == ScatterMode.FULL
+        ):
+            raise RuntimeError(
+                "MiniMax-M3 TBO currently requires DP attention, EP=1, "
+                "moe_dp_size=1, moe_a2a_backend=none, and FULL MoE layout"
+            )
+
+        local = state.pop("hidden_states_after_attn")
+        residual = state.pop("residual_after_input_ln")
+        if local.shape[0] > 0 and parallel.attn_tp_rank == 0:
+            local = local + residual
+
+        sub = state.tbo_subbatch_index
+        local_rows = state.forward_batch.tbo_padded_len
+        if local_rows is None:
+            raise RuntimeError("MiniMax-M3 decode TBO child is missing tbo_padded_len")
+        global_hidden = get_tbo_persistent_buffer(
+            ("minimax_m3_gh", sub),
+            local_rows * parallel.attn_dp_size,
+            local.shape[-1],
+            local.dtype,
+            local.device,
+        )
+        comm = get_dp_tbo_comm_stream()
+        compute = torch.cuda.current_stream()
+        with torch.cuda.stream(comm):
+            comm.wait_stream(compute)
+            dp_gather_partial(global_hidden, local, state.forward_batch)
+            event = _tbo_event(("minimax_m3_gather", sub))
+            event.record(comm)
+        state.gather_event = event
+        state.gather_keepalive = local
+        state.global_hidden = global_hidden
+        state.residual_after_comm_pre_mlp = residual
+
+    def op_gather_b(self, state):
+        torch.cuda.current_stream().wait_event(state.pop("gather_event"))
+        state.pop("gather_keepalive")
+        global_hidden = state.pop("global_hidden")
+        residual = state.residual_after_comm_pre_mlp
+        local_rows = state.forward_batch.tbo_padded_len
+        start = get_parallel().attn_dp_rank * local_rows
+        residual.copy_(global_hidden.narrow(0, start, local_rows))
+        if global_hidden.shape[0] > 0:
+            global_hidden = self.post_attention_layernorm(global_hidden)
+        state.global_hidden = global_hidden
+
+    def op_mlp(self, state):
+        hidden_states = state.pop("global_hidden")
+        if self.is_layer_sparse or hidden_states.shape[0] != 0:
+            hidden_states = self.mlp(
+                hidden_states,
+                forward_batch=state.forward_batch,
+                should_allreduce_fusion=False,
+                use_reduce_scatter=True,
+            )
+        state.global_mlp_output = hidden_states
+
+    def op_combine_a(self, state):
+        global_output = state.pop("global_mlp_output")
+        local_output = get_tbo_persistent_buffer(
+            ("minimax_m3_lo", state.tbo_subbatch_index),
+            state.forward_batch.tbo_padded_len,
+            global_output.shape[-1],
+            global_output.dtype,
+            global_output.device,
+        )
+        state.combine_event = dp_reduce_scatter_tensor_async(
+            local_output,
+            global_output,
+            event_key=("minimax_m3_combine", state.tbo_subbatch_index),
+        )
+        state.combine_keepalive = global_output
+        state.local_mlp_output = local_output
+
+    def op_combine_b(self, state):
+        torch.cuda.current_stream().wait_event(state.pop("combine_event"))
+        state.pop("combine_keepalive")
+        hidden_states = state.pop("local_mlp_output")
+        residual = state.pop("residual_after_comm_pre_mlp")
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=state.forward_batch,
+            zero_allocator=state.zero_allocator,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+        state.clear(
+            expect_keys={
+                "positions",
+                "forward_batch",
+                "zero_allocator",
+                "tbo_subbatch_index",
+            }
+        )
+        return output
+
 
 class MiniMaxM3Model(nn.Module):
     """MiniMax Model implementation."""
@@ -1488,7 +1795,24 @@ class MiniMaxM3Model(nn.Module):
             residual = pp_proxy_tensors["residual"]
 
         aux_hidden_states = []
-        if forward_batch.can_run_tbo:
+        # The MiniMax strategy currently targets decode's equal-padded
+        # (MAX_LEN) DP layout.  EXTEND/SUM_LEN child metadata needs a separate
+        # variable-length implementation and deliberately stays on the normal
+        # forward path.
+        run_decode_tbo = forward_batch.can_run_tbo and (
+            forward_batch.global_forward_mode
+            in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY)
+        ) and forward_batch.batch_size >= 2
+        run_decode_tbo = run_decode_tbo and (
+            forward_batch.tbo_children is not None
+            and all(
+                child.batch_size > 0
+                and child.tbo_padded_len is not None
+                and child.tbo_padded_len > 0
+                for child in forward_batch.tbo_children
+            )
+        )
+        if run_decode_tbo:
             hidden_states, residual = model_forward_maybe_tbo(
                 layers=self.layers,
                 enable_tbo=True,
@@ -1593,8 +1917,24 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 "Shared and routed experts may use different quantization formats "
                 "in ModelOpt mixed-precision checkpoints."
             )
+        # Keep the conservative platform checks below as the automatic policy,
+        # but honor the existing explicit override for validated deployments.
+        # In particular, the BW1100 channel-FP8 path uses the standard
+        # dispatcher plus AITER unified MoE and can represent the always-on
+        # shared expert as the 129th FP8 expert slot.  The override is required
+        # until that ROCm path has broad device coverage.
+        if get_exec().moe.enforce_shared_experts_fusion:
+            if hf_config.n_shared_experts != 1:
+                raise ValueError(
+                    "MiniMax-M3 shared-experts fusion expects exactly one shared "
+                    f"expert, but got n_shared_experts={hf_config.n_shared_experts}."
+                )
+            return None
         if not _is_cuda:
-            return "Shared experts fusion currently requires CUDA devices."
+            return (
+                "Shared experts fusion is disabled by default on non-CUDA devices "
+                "(use --enforce-shared-experts-fusion for a validated backend)."
+            )
         if _is_cuda and (_device_sm is not None) and (_device_sm < 80):
             return "Shared experts fusion requires SM80 or newer GPUs."
         if get_parallel().moe_ep_size > 1:

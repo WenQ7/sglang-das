@@ -78,6 +78,44 @@ def unit_scale(scale: Optional[float]) -> float:
     return 1.0 if scale is None else scale
 
 
+def merge_dcp_block_scores(
+    local_score: torch.Tensor, dcp_group, dcp_size: int
+) -> torch.Tensor:
+    """Merge MiniMax ``score_type=max`` block scores exactly across DCP ranks."""
+    if dcp_size == 1:
+        return local_score
+    if dcp_group is None or dcp_group.world_size != dcp_size:
+        raise ValueError("DCP block-score merge requires its matching group")
+    gathered = dcp_group.all_gather(local_score, dim=0)
+    expected = dcp_size * local_score.numel()
+    if gathered.numel() != expected:
+        raise RuntimeError(
+            "DCP block-score all-gather returned an unexpected tensor size: "
+            f"expected={expected}, actual={gathered.numel()}"
+        )
+    return gathered.view(dcp_size, *local_score.shape).amax(dim=0)
+
+
+def get_dcp_cache_store_loc_and_mask(
+    virtual_loc: torch.Tensor,
+    positions: Optional[torch.Tensor],
+    fallback_mask: Optional[torch.Tensor],
+    dcp_size: int,
+    dcp_rank: int,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Translate virtual DCP slots and resolve the rank-local token mask."""
+    if dcp_size == 1:
+        return virtual_loc, None
+    physical_loc = virtual_loc // dcp_size
+    if positions is not None and positions.numel() == physical_loc.numel():
+        mask = positions % dcp_size == dcp_rank
+    else:
+        mask = fallback_mask
+    if mask is None or mask.numel() != physical_loc.numel():
+        raise RuntimeError("DCP cache store requires a per-token ownership mask")
+    return physical_loc, mask
+
+
 try:
     make_tensor_descriptor = tl.make_tensor_descriptor
 except Exception:
