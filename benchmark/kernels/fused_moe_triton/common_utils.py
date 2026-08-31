@@ -166,7 +166,7 @@ def get_model_config(
             0 if disable_shared_experts_fusion else 1
         )
         topk = config.num_experts_per_tok + (
-            0 if disable_shared_experts_fusion or topk_ids_dir is None else 1
+            0 if disable_shared_experts_fusion else 1
         )
         intermediate_size = config.intermediate_size
     elif architecture == "UnlimitedOCRForCausalLM":
