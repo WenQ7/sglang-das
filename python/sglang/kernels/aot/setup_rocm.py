@@ -74,9 +74,11 @@ if torch.cuda.is_available():
 else:
     print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
 
-if amdgpu_target not in ["gfx942", "gfx950", "gfx1250"]:
+supported_targets = ["gfx938", "gfx942", "gfx950", "gfx1250"]
+if amdgpu_target not in supported_targets:
     print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942', 'gfx950', or 'gfx1250'."
+        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. "
+        f"Expected one of: {', '.join(supported_targets)}."
     )
     sys.exit(1)
 

@@ -47,7 +47,11 @@ __device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffff
   int original = v;
 #pragma unroll
   for (int offset = 1; offset < WARP_SIZE; offset <<= 1) {
+#ifdef USE_ROCM
+    int n = __shfl_up(v, offset);
+#else
     int n = __shfl_up_sync(mask, v, offset);
+#endif
     if ((threadIdx.x & (WARP_SIZE - 1)) >= offset) v += n;
   }
   return v - original;
