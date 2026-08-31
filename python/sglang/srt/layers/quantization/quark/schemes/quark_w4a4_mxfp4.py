@@ -29,9 +29,15 @@ NVFP4_BLOCK_SIZE = 16
 
 _is_hip = is_hip()
 if _is_hip:
-    from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
-        fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
-    )
+    try:
+        from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
+            fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
+        )
+    except ImportError as exc:
+        _fused_gemm_afp4wfp4_split_cat_orig = None
+        _fused_gemm_afp4wfp4_split_cat_import_error = exc
+    else:
+        _fused_gemm_afp4wfp4_split_cat_import_error = None
     from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4 as _gemm_afp4wfp4_orig
     from aiter.ops.triton.gemm_afp4wfp4_pre_quant_atomic import (
         gemm_afp4wfp4_pre_quant as _gemm_afp4wfp4_pre_quant_orig,
@@ -126,6 +132,12 @@ if _is_hip:
         S1: int,
         S2: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if _fused_gemm_afp4wfp4_split_cat_orig is None:
+            raise RuntimeError(
+                "Quark W4A4 MXFP4 split-cat requires "
+                "aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat, "
+                "which is not provided by the installed AITER build."
+            ) from _fused_gemm_afp4wfp4_split_cat_import_error
         return _fused_gemm_afp4wfp4_split_cat_orig(
             x=x,
             w=w,
