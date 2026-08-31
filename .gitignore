@@ -281,3 +281,6 @@ artifacts/
 
 # Internal, non-published docs
 internal-docs/
+
+# Machine-specific MoE tuning outputs are deployment data, not source.
+/moe_configs/

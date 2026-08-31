@@ -28,12 +28,10 @@ logger = logging.getLogger(__name__)
 
 _AITER_UNIFIED_MOE_CONFIG_CACHE: dict[tuple, Any] = {}
 _AITER_UNIFIED_MOE_FALLBACK_WARNINGS: set[tuple] = set()
-_AITER_NATIVE_MOE_CONFIG_ROOT: Optional[str] = None
 
 
 @functools.cache
-def _repository_asm_has_exact_shape(
-    config_root: str,
+def _aiter_asm_has_exact_shape(
     arch: str,
     experts: int,
     intermediate_size: int,
@@ -41,11 +39,14 @@ def _repository_asm_has_exact_shape(
     top_k: int,
     m: int,
     input_dtype: str,
+    csv_path: Optional[str] = None,
 ) -> bool:
-    """Check that compact LL uses a numerically gated exact ASM row."""
-    path = os.path.join(
-        config_root, "asm", "tuned_fmoe_asm_w8a8_channel.csv"
-    )
+    """Check that compact LL uses an exact row from AITER's ASM table."""
+    if csv_path is None:
+        from aiter.fused_moe_asm_wna16 import get_csv_path
+
+        csv_path = get_csv_path("f8_w8a8_channel")
+    path = os.path.abspath(csv_path)
     if not os.path.isfile(path):
         return False
     try:
@@ -68,17 +69,21 @@ def _repository_asm_has_exact_shape(
 
 
 @functools.cache
-def _repository_moe_c_has_exact_m(
-    config_root: str,
+def _aiter_moe_c_has_exact_m(
     arch: str,
     experts: int,
     intermediate_size: int,
     quant_type: str,
     m: int,
+    config_root: Optional[str] = None,
 ) -> Optional[bool]:
-    """Return exact-M coverage when a repository MoE-C table exists."""
+    """Return exact-M coverage when an installed AITER MoE-C table exists."""
+    if config_root is None:
+        from aiter.fused_moe_c import _moe_c_config_root
+
+        config_root = _moe_c_config_root()
     category = "fp8_w8a8" if quant_type == "fp8_w8a8" else quant_type
-    directory = os.path.join(config_root, "moe_c", arch, category)
+    directory = os.path.join(config_root, arch, category)
     base = f"E={experts},N={intermediate_size},dtype={category}"
     top_path = os.path.join(directory, f"{base}.json")
     bottom_path = os.path.join(directory, f"{base},is_bottom=True.json")
@@ -95,112 +100,6 @@ def _repository_moe_c_has_exact_m(
         return False
     key = str(m)
     return key in top and key in bottom
-
-
-def _clear_wrapped_cache(function: Any) -> None:
-    """Clear an lru cache even when torch decorators wrap the callable."""
-    seen: set[int] = set()
-    current = function
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        cache_clear = getattr(current, "cache_clear", None)
-        if callable(cache_clear):
-            cache_clear()
-        current = getattr(current, "__wrapped__", None)
-
-
-def _configure_aiter_native_moe_config_paths(config_root: str) -> None:
-    """Load repository-owned ASM/MoE-C tuning data before auto selection.
-
-    AITER's solution priority remains unchanged.  This only adds deployment
-    configs to its lookup paths, so ``get_aiter_moe_config`` still selects
-    channel-FP8 in the native order ASM -> MoE-C -> Triton -> CK.
-    """
-    global _AITER_NATIVE_MOE_CONFIG_ROOT
-
-    native_root = os.path.abspath(config_root)
-    if _AITER_NATIVE_MOE_CONFIG_ROOT == native_root:
-        return
-
-    asm_path = os.path.join(
-        native_root, "asm", "tuned_fmoe_asm_w8a8_channel.csv"
-    )
-    if os.path.isfile(asm_path):
-        import aiter.fused_moe_asm_wna16 as asm_module
-
-        # The FP8 and INT8 channel tables share an upstream CSV. Override only
-        # the FP8 keys so other quantization modes retain their installed data.
-        asm_module.CSV_FILE_MAPPING["f8_w8a8_channel"] = asm_path
-        asm_module._cached_data_by_quant.pop("f8_w8a8_channel", None)
-        _clear_wrapped_cache(asm_module.get_moe_asm_solution)
-        logger.info("Using repository AITER ASM MoE config %s", asm_path)
-
-    moe_c_root = os.path.join(native_root, "moe_c")
-    if os.path.isdir(moe_c_root):
-        import aiter.fused_moe_c as moe_c_module
-
-        # Keep the installed AITER tree as a fallback for unrelated shapes.
-        original_find = getattr(
-            moe_c_module,
-            "_sglang_original_find_moe_c_config_file",
-            moe_c_module._find_moe_c_config_file,
-        )
-        moe_c_module._sglang_original_find_moe_c_config_file = original_find
-
-        def find_with_deployment_override(
-            json_file_name: str,
-            dtype: Optional[str],
-            block_shape: Optional[list[int]],
-            arch: Optional[str] = None,
-        ) -> str:
-            category = moe_c_module._moe_c_config_category(dtype, block_shape)
-            candidates = []
-            if arch and category:
-                candidates.append(
-                    os.path.join(moe_c_root, arch, category, json_file_name)
-                )
-            if arch:
-                candidates.append(os.path.join(moe_c_root, arch, json_file_name))
-            if category:
-                candidates.append(os.path.join(moe_c_root, category, json_file_name))
-            candidates.append(os.path.join(moe_c_root, json_file_name))
-            for candidate in candidates:
-                if os.path.isfile(candidate):
-                    return candidate
-            return original_find(json_file_name, dtype, block_shape, arch)
-
-        moe_c_module._find_moe_c_config_file = find_with_deployment_override
-        _clear_wrapped_cache(moe_c_module.get_moe_configs)
-        _clear_wrapped_cache(moe_c_module.get_moe_configs_marlin)
-        logger.info("Using repository AITER MoE-C config root %s", moe_c_root)
-
-    _AITER_NATIVE_MOE_CONFIG_ROOT = native_root
-
-
-def _configure_aiter_triton_config_path() -> None:
-    """Point AITER's Triton MoE lookup at an optional deployment config tree."""
-    config_root = os.environ.get("SGLANG_AITER_TRITON_CONFIGS_PATH")
-    if not config_root:
-        return
-    config_root = os.path.abspath(config_root)
-    moe_dir = os.path.join(config_root, "moe")
-    if not os.path.isdir(moe_dir):
-        raise RuntimeError(
-            "SGLANG_AITER_TRITON_CONFIGS_PATH must contain a moe directory, "
-            f"got {config_root}"
-        )
-
-    # AITER currently exposes no environment override for this path.  Updating
-    # the loader module keeps the tuned configs in the SGLang deployment tree
-    # instead of requiring writes into site-packages.  Clear its lru_cache so
-    # an earlier default-path miss cannot mask the deployment config.
-    from aiter.ops.triton.utils import moe_config_utils
-
-    if moe_config_utils.AITER_TRITON_CONFIGS_PATH != config_root:
-        moe_config_utils.AITER_TRITON_CONFIGS_PATH = config_root
-        moe_config_utils.get_moe_configs.cache_clear()
-        logger.info("Using AITER Triton configs from %s", config_root)
-    _configure_aiter_native_moe_config_paths(config_root)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.base import CombineInput
@@ -441,7 +340,6 @@ class AiterRunnerCore(MoeRunnerCore):
         quant_type: str,
         block_size: int,
     ) -> Any:
-        _configure_aiter_triton_config_path()
         from aiter.moe import (
             AiterMoeConfig,
             MoeSolutionType,
@@ -488,9 +386,7 @@ class AiterRunnerCore(MoeRunnerCore):
             exact_compact_asm = (
                 status
                 and moe_config.solution_type == MoeSolutionType.ASM
-                and _AITER_NATIVE_MOE_CONFIG_ROOT is not None
-                and _repository_asm_has_exact_shape(
-                    _AITER_NATIVE_MOE_CONFIG_ROOT,
+                and _aiter_asm_has_exact_shape(
                     get_gfx(),
                     w1.shape[0],
                     w1.shape[1] // 2 if self.config.is_gated else w1.shape[1],
@@ -504,28 +400,23 @@ class AiterRunnerCore(MoeRunnerCore):
             exact_compact_asm = True
         if not exact_compact_asm:
             # The compact DeepEP-LL representation uses local TopK=1 ids.
-            # Only exact repository ASM rows are admitted: generic Triton is
+            # Only exact installed ASM rows are admitted: generic Triton is
             # the safe fallback, while MoE-C's nearest-M lookup and shuffled
             # weights have not passed this layout's service-level gate.
             status = False
         if status and moe_config.solution_type == MoeSolutionType.MOE_C:
             from aiter.jit.utils.chip_info import get_gfx
 
-            exact_coverage = (
-                _repository_moe_c_has_exact_m(
-                    _AITER_NATIVE_MOE_CONFIG_ROOT,
-                    get_gfx(),
-                    w1.shape[0],
-                    w1.shape[1] // 2 if self.config.is_gated else w1.shape[1],
-                    quant_type,
-                    runner_input.hidden_states.shape[0],
-                )
-                if _AITER_NATIVE_MOE_CONFIG_ROOT is not None
-                else None
+            exact_coverage = _aiter_moe_c_has_exact_m(
+                get_gfx(),
+                w1.shape[0],
+                w1.shape[1] // 2 if self.config.is_gated else w1.shape[1],
+                quant_type,
+                runner_input.hidden_states.shape[0],
             )
             if exact_coverage is False:
                 logger.warning(
-                    "Repository AITER MoE-C config has no exact validated "
+                    "Installed AITER MoE-C config has no exact validated "
                     "entry for M=%s, E=%s, N=%s, quant=%s; rejecting nearest-M "
                     "MoE-C reuse and falling back to Triton.",
                     runner_input.hidden_states.shape[0],
@@ -535,7 +426,7 @@ class AiterRunnerCore(MoeRunnerCore):
                 )
                 status = False
         if not status:
-            # The direct Triton path has safe heuristics even when the external
+            # The direct Triton path has safe heuristics even when the installed
             # tuned-config table has no MiniMax-M3/BW1100 entry.
             moe_config = AiterMoeConfig(
                 quant_type=quant_type,

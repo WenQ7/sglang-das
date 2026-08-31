@@ -619,36 +619,35 @@ def test_unified_aiter_moe_c_uses_oai_activation_and_interleaved_scale(
     ]
 
 
-def test_repository_moe_c_requires_exact_m_in_both_stage_tables(tmp_path):
-    directory = tmp_path / "moe_c" / "gfx938" / "fp8_w8a8"
+def test_aiter_moe_c_requires_exact_m_in_both_stage_tables(tmp_path):
+    directory = tmp_path / "gfx938" / "fp8_w8a8"
     directory.mkdir(parents=True)
     base = "E=16,N=3072,dtype=fp8_w8a8"
     (directory / f"{base}.json").write_text('{"512": {}}')
     (directory / f"{base},is_bottom=True.json").write_text('{"512": {}}')
 
-    assert aiter_runner._repository_moe_c_has_exact_m(
-        str(tmp_path), "gfx938", 16, 3072, "fp8_w8a8", 512
+    assert aiter_runner._aiter_moe_c_has_exact_m(
+        "gfx938", 16, 3072, "fp8_w8a8", 512, str(tmp_path)
     )
-    assert not aiter_runner._repository_moe_c_has_exact_m(
-        str(tmp_path), "gfx938", 16, 3072, "fp8_w8a8", 1024
+    assert not aiter_runner._aiter_moe_c_has_exact_m(
+        "gfx938", 16, 3072, "fp8_w8a8", 1024, str(tmp_path)
     )
 
 
-def test_repository_compact_asm_requires_exact_shape(tmp_path):
-    directory = tmp_path / "asm"
-    directory.mkdir()
-    (directory / "tuned_fmoe_asm_w8a8_channel.csv").write_text(
+def test_aiter_compact_asm_requires_exact_shape(tmp_path):
+    csv_path = tmp_path / "tuned_fmoe_asm_w8a8_channel.csv"
+    csv_path.write_text(
         "arch,quant_type,indtype,token,inter_dim,model_dim,expert,topk,"
         "q_size_n,q_size_k,sol_type,sol_id,time_us\n"
         "gfx938,f8_w8a8_channel,torch.float8_e4m3fn,64,3072,6144,16,1,"
         "0,0,asm,10011+20000,700.0\n"
     )
 
-    assert aiter_runner._repository_asm_has_exact_shape(
-        str(tmp_path), "gfx938", 16, 3072, 6144, 1, 64, "torch.float8_e4m3fn"
+    assert aiter_runner._aiter_asm_has_exact_shape(
+        "gfx938", 16, 3072, 6144, 1, 64, "torch.float8_e4m3fn", str(csv_path)
     )
-    assert not aiter_runner._repository_asm_has_exact_shape(
-        str(tmp_path), "gfx938", 16, 3072, 6144, 1, 96, "torch.float8_e4m3fn"
+    assert not aiter_runner._aiter_asm_has_exact_shape(
+        "gfx938", 16, 3072, 6144, 1, 96, "torch.float8_e4m3fn", str(csv_path)
     )
 
 
