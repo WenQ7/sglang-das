@@ -13,6 +13,7 @@
 # ==============================================================================
 """Fused operators for normalization layers."""
 
+import inspect
 import logging
 from functools import lru_cache
 from typing import Optional, Tuple, Union
@@ -54,6 +55,15 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
+try:
+    from vllm_hcu.platforms.hcu import on_gfx93x
+except ImportError:
+    _is_hcu = False
+else:
+    _is_hcu = on_gfx93x()
+_use_hcu_lightop_gemma_rmsnorm = _is_hcu and get_bool_env_var(
+    "SGLANG_USE_LIGHTOP_GEMMA_RMSNORM"
+)
 _flashinfer_layernorm_available = False
 _flashinfer_rmsnorm_quant_available = False
 
@@ -124,6 +134,9 @@ elif _is_hip:
         # Fallback: vllm not available, will use forward_native
         _has_vllm_rms_norm = False
 
+if _use_hcu_lightop_gemma_rmsnorm:
+    from lightop import gemma_fused_add_rmsnorm as gemma_fused_add_rmsnorm_hcu
+
 if _is_hip:
     try:
         from sglang.kernels.ops.layernorm.minimax_m3_rmsnorm import (
@@ -168,6 +181,59 @@ if _is_cuda:
 
 
 logger = logging.getLogger(__name__)
+
+
+@lru_cache(maxsize=None)
+def _fused_add_rms_norm_arity(op) -> Optional[int]:
+    """Return the Python wrapper arity for known vLLM RMSNorm ABIs."""
+    try:
+        parameters = inspect.signature(op).parameters.values()
+    except (TypeError, ValueError):
+        return None
+    positional = [
+        parameter
+        for parameter in parameters
+        if parameter.kind
+        in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)
+    ]
+    if any(parameter.kind == parameter.VAR_POSITIONAL for parameter in parameters):
+        return None
+    return len(positional) if len(positional) in (4, 6) else None
+
+
+def _call_vllm_fused_add_rms_norm(
+    op,
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Call either the current in-place or legacy out-parameter vLLM ABI."""
+    arity = _fused_add_rms_norm_arity(op)
+    if arity == 4:
+        op(x, residual, weight, eps)
+        return x, residual
+
+    if arity == 6:
+        out = torch.empty_like(x)
+        residual_out = torch.empty_like(x)
+        op(out, x, residual_out, residual, weight, eps)
+        return out, residual_out
+
+    # Some extension wrappers do not expose an inspectable signature. A wrong
+    # argument count fails before kernel launch, so it is safe to probe the
+    # current ABI and fall back only on TypeError.
+    try:
+        op(x, residual, weight, eps)
+    except TypeError as current_abi_error:
+        out = torch.empty_like(x)
+        residual_out = torch.empty_like(x)
+        try:
+            op(out, x, residual_out, residual, weight, eps)
+        except TypeError:
+            raise current_abi_error
+        return out, residual_out
+    return x, residual
 
 
 if _is_npu:
@@ -690,14 +756,15 @@ class RMSNorm(BaseFusedOp):
             # NOTE: Remove this if aiter kernel supports discontinuous input
             x = x.contiguous()
         if residual is not None:
-            out = torch.empty_like(x)
-            residual_out = torch.empty_like(x)
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            fused_add_rms_norm(
-                out, x, residual_out, residual, self.weight.data, self.variance_epsilon
+            return _call_vllm_fused_add_rms_norm(
+                fused_add_rms_norm,
+                x,
+                residual,
+                self.weight.data,
+                self.variance_epsilon,
             )
-            return out, residual_out
         out = torch.empty_like(x)
         rms_norm(out, x, self.weight.data, self.variance_epsilon)
         return out
@@ -1098,19 +1165,27 @@ class GemmaRMSNorm(BaseFusedOp):
             return self.forward_native(x, residual, post_residual_addition)
         else:
             w = self.gemma_weight
-            # vllm API: rms_norm(out, input, weight, eps) -> None (in-place)
-            #           fused_add_rms_norm(out, input, residual_out, residual, weight, eps)
+            # vllm API: rms_norm(out, input, weight, eps) -> None (in-place).
+            # fused_add_rms_norm has both current four-argument and legacy
+            # six-argument wheel ABIs; the helper handles either contract.
             if not x.is_contiguous():
                 x = x.contiguous()
             if residual is not None:
-                out = torch.empty_like(x)
-                residual_out = torch.empty_like(x)
+                if _use_hcu_lightop_gemma_rmsnorm:
+                    if post_residual_addition is not None:
+                        residual = residual + post_residual_addition
+                    return gemma_fused_add_rmsnorm_hcu(
+                        x, residual, self.weight.data, self.variance_epsilon
+                    )
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
-                fused_add_rms_norm(
-                    out, x, residual_out, residual, w, self.variance_epsilon
+                return _call_vllm_fused_add_rms_norm(
+                    fused_add_rms_norm,
+                    x,
+                    residual,
+                    w,
+                    self.variance_epsilon,
                 )
-                return out, residual_out
             out = torch.empty_like(x)
             rms_norm(out, x, w, self.variance_epsilon)
             return out

@@ -67,6 +67,11 @@ if _is_musa:
     from sglang.kernels.ops.quantization import sgl_per_token_group_quant_8bit
 
 if _is_hip:
+    try:
+        from sgl_kernel import sgl_per_token_quant_fp8 as _hip_per_token_quant_fp8
+    except (ImportError, AttributeError):
+        _hip_per_token_quant_fp8 = None
+
     _has_vllm = False
     if _use_aiter:
         try:
@@ -801,6 +806,16 @@ def sglang_per_token_quant_fp8(
 ):
     assert x.is_contiguous(), "`x` is not contiguous"
 
+    # Some ROCm/HCU wheels omit this AOT op. Prefer it when the installed wheel
+    # actually exports it, and fall back to Triton only for that missing-op
+    # case instead of changing the quantization path for every HIP platform.
+    if _is_hip and _hip_per_token_quant_fp8 is None:
+        return _per_token_group_quant_8bit_raw(
+            x=x,
+            group_size=x.shape[-1],
+            dtype=dtype,
+        )
+
     x_q = torch.empty_like(x, device=x.device, dtype=dtype)
     x_s = torch.empty(
         x.shape[0],
@@ -809,7 +824,10 @@ def sglang_per_token_quant_fp8(
         dtype=torch.float32,
     )
 
-    sgl_per_token_quant_fp8(x, x_q, x_s)
+    if _is_hip:
+        _hip_per_token_quant_fp8(x, x_q, x_s)
+    else:
+        sgl_per_token_quant_fp8(x, x_q, x_s)
 
     return x_q, x_s
 
