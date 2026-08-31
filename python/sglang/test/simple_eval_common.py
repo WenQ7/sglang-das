@@ -97,6 +97,7 @@ class ChatCompletionSampler(SamplerBase):
         extra_body: Optional[Dict[str, Any]] = None,
         stop: Optional[List[str]] = None,
         record_meta_info: bool = False,
+        use_reasoning_content_fallback: bool = False,
     ):
         self.client = OpenAI(base_url=base_url, http_client=LargerHttpxClient())
 
@@ -114,6 +115,7 @@ class ChatCompletionSampler(SamplerBase):
         self.image_format = "url"
         self._completion_tokens: list[int] = []
         self.record_meta_info = record_meta_info
+        self.use_reasoning_content_fallback = use_reasoning_content_fallback
         self._meta_infos: List[Dict[str, Any]] = []
         print(
             f"ChatCompletionSampler initialized with {self.system_message=} {self.temperature=} {self.max_tokens=} {self.reasoning_effort=} {self.extra_body=} {self.stop=} {self.record_meta_info=}"
@@ -167,7 +169,18 @@ class ChatCompletionSampler(SamplerBase):
                         self._meta_infos.append(meta_info)
                 if response.usage and response.usage.completion_tokens is not None:
                     self._completion_tokens.append(response.usage.completion_tokens)
-                return response.choices[0].message.content or ""
+                message = response.choices[0].message
+                content = message.content or ""
+                if content:
+                    return content
+
+                if self.use_reasoning_content_fallback:
+                    # MiniMax-M3 can consume the generation budget before
+                    # emitting final content. Its eval adapter explicitly opts
+                    # into treating reasoning_content as the candidate answer.
+                    reasoning_content = getattr(message, "reasoning_content", None)
+                    return reasoning_content or ""
+                return ""
             # NOTE: BadRequestError is triggered once for MMMU, please uncomment if you are rerunning MMMU
             except openai.BadRequestError as e:
                 print("Bad Request Error", e)

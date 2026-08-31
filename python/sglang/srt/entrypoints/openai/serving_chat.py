@@ -1059,6 +1059,21 @@ class OpenAIServingChat(OpenAIServingBase):
             if effort is not None and request.reasoning_effort is None:
                 request.reasoning_effort = effort
 
+        # The common OpenAI/SGL-Eval reasoning switch is `thinking: bool`, but
+        # MiniMax-M3's released chat template reads the model-specific
+        # `thinking_mode` string.  Normalize at the request boundary so the
+        # standard `sgl-eval --thinking` command really emits the M3
+        # `<mm:think>` generation prefix and the reasoning parser sees the same
+        # mode.  An explicit thinking_mode remains authoritative.
+        if self.reasoning_parser == "minimax-m3":
+            ctk = dict(request.chat_template_kwargs or {})
+            generic_thinking = ctk.get("thinking")
+            if "thinking_mode" not in ctk and isinstance(generic_thinking, bool):
+                ctk["thinking_mode"] = (
+                    "enabled" if generic_thinking else "disabled"
+                )
+                request.chat_template_kwargs = ctk
+
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
             request.skip_special_tokens = False

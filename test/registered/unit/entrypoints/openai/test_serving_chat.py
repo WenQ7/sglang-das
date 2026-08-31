@@ -491,6 +491,56 @@ class ServingChatTestCase(unittest.TestCase):
 
         self.assertTrue(processed.require_reasoning)
 
+    def test_minimax_m3_normalizes_generic_thinking_for_template(self):
+        self.chat.reasoning_parser = "minimax-m3"
+        rendered = MessageProcessingResult(
+            prompt="prompt",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+
+        for generic, expected_mode, expected_reasoning in (
+            (True, "enabled", True),
+            (False, "disabled", False),
+        ):
+            with self.subTest(generic=generic):
+                request = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "What is 2+2?"}],
+                    chat_template_kwargs={"thinking": generic},
+                )
+                with patch.object(
+                    self.chat, "_apply_conversation_template", return_value=rendered
+                ):
+                    processed = self.chat._process_messages(
+                        request, is_multimodal=False
+                    )
+
+                self.assertEqual(
+                    request.chat_template_kwargs["thinking_mode"], expected_mode
+                )
+                self.assertEqual(processed.require_reasoning, expected_reasoning)
+
+        explicit = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is 2+2?"}],
+            chat_template_kwargs={
+                "thinking": True,
+                "thinking_mode": "adaptive",
+            },
+        )
+        with patch.object(
+            self.chat, "_apply_conversation_template", return_value=rendered
+        ):
+            processed = self.chat._process_messages(explicit, is_multimodal=False)
+
+        self.assertEqual(explicit.chat_template_kwargs["thinking_mode"], "adaptive")
+        self.assertFalse(processed.require_reasoning)
+
     def test_kimi_tool_call_respects_explicit_reasoning_disable(self):
         self.template_manager.reasoning_config = ReasoningToggleConfig(
             toggle_param="thinking", default_enabled=True

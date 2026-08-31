@@ -1,5 +1,6 @@
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,7 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.run_eval import _run_sgl_eval
+from sglang.test.run_eval import _run_sgl_eval, run_eval_once
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-b-test-cpu")
@@ -16,7 +17,30 @@ register_cpu_ci(est_time=5, suite="base-b-test-cpu")
 def _write_fake_metrics(out_parent: Path, eval_name: str, payload: dict) -> None:
     run_dir = out_parent / f"sgl_eval_{eval_name}_20260101-000000"
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "metrics.json").write_text(json.dumps(payload))
+    complete_payload = {"num_examples": 7, "n_repeats": 1, **payload}
+    (run_dir / "metrics.json").write_text(json.dumps(complete_payload))
+
+
+class TestChatEvalReasoningFallback(CustomTestCase):
+    def _captured_sampler_kwargs(self, model: str) -> dict:
+        captured = {}
+
+        class FakeSampler:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        args = SimpleNamespace(model=model, api="chat")
+        with patch("sglang.test.run_eval.ChatCompletionSampler", FakeSampler):
+            run_eval_once(args, "http://127.0.0.1:30000/v1", lambda sampler: {})
+        return captured
+
+    def test_minimax_opts_into_reasoning_content_fallback(self):
+        kwargs = self._captured_sampler_kwargs("/models/MiniMax-M3-channel-fp8")
+        self.assertTrue(kwargs["use_reasoning_content_fallback"])
+
+    def test_other_models_keep_content_only_eval_semantics(self):
+        kwargs = self._captured_sampler_kwargs("Qwen/Qwen3")
+        self.assertFalse(kwargs["use_reasoning_content_fallback"])
 
 
 class TestRunSglEval(CustomTestCase):
@@ -170,6 +194,21 @@ class TestRunSglEval(CustomTestCase):
         self.assertIn(
             "--thinking", self._capture_cmd(model="Qwen/Qwen3.5-397B-A17B-FP8")
         )
+
+    def test_minimax_uses_reasoning_content_compatible_cli(self):
+        cmd = self._capture_cmd(model="/models/MiniMax-M3-channel-fp8")
+
+        self.assertEqual(
+            cmd[:4],
+            [
+                sys.executable,
+                "-m",
+                "sglang.test.sgl_eval_reasoning_compat",
+                "run",
+            ],
+        )
+        self.assertIn("--thinking", cmd)
+        self.assertIn("thinking_mode=\"enabled\"", cmd)
 
     def test_explicit_thinking_false_suppresses_auto_detect(self):
         """A caller matching a harness that sent no chat_template_kwargs has to be
