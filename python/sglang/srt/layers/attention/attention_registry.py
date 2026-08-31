@@ -232,6 +232,24 @@ def create_flashattention_v3_backend(runner):
         return MusaFlashAttentionBackend(runner)
 
 
+@register_attention_backend("hcu_fa")
+def create_hcu_flashattention_backend(runner):
+    if not _is_hip:
+        raise ValueError("hcu_fa is only available on HIP/HCU platforms.")
+    if runner.use_mla_backend:
+        raise ValueError("hcu_fa currently supports MHA/GQA models, not MLA.")
+    if runner.page_size != 64:
+        raise ValueError(
+            "hcu_fa on BW1100 currently requires --page-size 64; got "
+            f"{runner.page_size}."
+        )
+    from sglang.srt.layers.attention.flashattention_backend import (
+        FlashAttentionBackend,
+    )
+
+    return FlashAttentionBackend(runner, fa_impl_ver=3, hcu_flash=True)
+
+
 @register_attention_backend("fa4")
 def create_flashattention_v4_backend(runner):
     from sglang.srt.layers.attention.flashattention_backend import (

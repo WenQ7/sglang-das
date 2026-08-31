@@ -202,6 +202,7 @@ ATTENTION_BACKEND_CHOICES = [
     # AMD specific
     "aiter",
     "wave",
+    "hcu_fa",  # BW1100 flash_attn varlen_fwd_unified adapter, page-size 64
     # Other platforms
     "intel_amx",
     "ascend",
@@ -221,6 +222,7 @@ CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS = [
     "cutlass_mla",
     "trtllm_mla",
     "tokenspeed_mla",
+    "hcu_fa",
 ]
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [

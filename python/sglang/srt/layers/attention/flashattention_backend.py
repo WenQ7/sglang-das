@@ -157,6 +157,7 @@ class FlashAttentionBackend(AttentionBackend):
         topk=0,
         speculative_num_steps=0,
         fa_impl_ver=3,
+        hcu_flash: bool = False,
     ):
         super().__init__()
 
@@ -259,8 +260,21 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Select version
         self.fa_impl_ver = fa_impl_ver
+        self.hcu_flash = hcu_flash
         device_capability = get_device_capability()
-        if self.fa_impl_ver == 3:
+        if self.hcu_flash:
+            if self.fa_impl_ver != 3:
+                raise ValueError("hcu_fa uses the FA3-compatible call contract")
+            from sglang.kernels.ops.attention.hcu_flash_attention import (
+                flash_attn_varlen_func,
+                flash_attn_with_kvcache,
+            )
+
+            # The HCU unified kernel performs its own scheduling and does not
+            # consume NVIDIA FA3 scheduler metadata.
+            self._get_scheduler_metadata = None
+            self._get_fa_runtime_policy = None
+        elif self.fa_impl_ver == 3:
             from sgl_kernel.flash_attn import (
                 flash_attn_varlen_func,
                 flash_attn_with_kvcache,
