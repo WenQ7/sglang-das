@@ -37,6 +37,18 @@ _is_musa = is_musa()
 logger = logging.getLogger(__name__)
 
 
+def _aiter_enable_register_for_capturing(tms_cudagraph: bool) -> bool:
+    """Resolve AITER's direct graph-input registration mode.
+
+    Memory-saver graphs require copy-in mode.  Outside memory-saver mode,
+    honor AITER's documented environment switch instead of forcing direct
+    registration unconditionally.
+    """
+    return not tms_cudagraph and get_bool_env_var(
+        "AITER_AR_ENABLE_REG_CAPTURE", default="true"
+    )
+
+
 class CustomAllreduce:
     _SUPPORTED_WORLD_SIZES = [2, 4, 6, 8]
     _MAX_CAR_SIZE = 8192 * 1024
@@ -397,9 +409,18 @@ def dispatch_custom_allreduce(
 
             logger.info("[AR] Using AiterCustomAllreduce (AMD default)")
             tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+            enable_register_for_capturing = _aiter_enable_register_for_capturing(
+                tms_cudagraph
+            )
+            logger.info(
+                "[AR] AITER CUDA-graph input mode: %s",
+                "direct-register"
+                if enable_register_for_capturing
+                else "copy-in",
+            )
             return partial(
                 AiterCustomAllreduce,
-                enable_register_for_capturing=not tms_cudagraph,
+                enable_register_for_capturing=enable_register_for_capturing,
             )
         except ImportError as e:
             logger.warning(

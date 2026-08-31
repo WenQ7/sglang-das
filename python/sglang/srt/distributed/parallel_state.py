@@ -1127,6 +1127,16 @@ class GroupCoordinator:
         # matching the per-rank output rows.
         if input.shape[0] != output.shape[0] * self.world_size:
             return False
+        if not getattr(self, "_logged_first_aiter_reduce_scatter", False):
+            logger.info(
+                "[RS] AITER custom reduce-scatter selected: input_bytes=%d, "
+                "output_bytes=%d, dtype=%s, world_size=%d",
+                input.numel() * input.element_size(),
+                output.numel() * output.element_size(),
+                input.dtype,
+                self.world_size,
+            )
+            self._logged_first_aiter_reduce_scatter = True
         if getattr(ca_comm, "_IS_CAPTURING", False):
             if torch.cuda.is_current_stream_capturing():
                 if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():
@@ -1216,6 +1226,16 @@ class GroupCoordinator:
             and input.dtype in (torch.float32, torch.float16, torch.bfloat16)
             and ca_comm.should_custom_ag(input)
         ):
+            if not getattr(self, "_logged_first_aiter_all_gather", False):
+                logger.info(
+                    "[AG] AITER custom all-gather selected: input_bytes=%d, "
+                    "output_bytes=%d, dtype=%s, world_size=%d",
+                    input.numel() * input.element_size(),
+                    output.numel() * output.element_size(),
+                    input.dtype,
+                    self.world_size,
+                )
+                self._logged_first_aiter_all_gather = True
             if getattr(ca_comm, "_IS_CAPTURING", False):
                 if torch.cuda.is_current_stream_capturing():
                     if envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get():

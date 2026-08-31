@@ -32,7 +32,21 @@ def qr_rocm_arch_available():
         props = torch.cuda.get_device_properties(0)
         gcn_arch = getattr(props, "gcnArchName", "")
         supported_archs = ["gfx94", "gfx95"]
-        return any(gfx in gcn_arch for gfx in supported_archs)
+        if any(gfx in gcn_arch for gfx in supported_archs):
+            return True
+        # BW1100 (gfx938) ships the QuickReduce symbols in the local HCU AOT
+        # extension, but upstream's MI300-only allowlist prevents even an A/B.
+        # Keep this explicit until the kernel has passed the full model accuracy
+        # and multi-size communication sweep on this platform.
+        if "gfx938" in gcn_arch and os.environ.get(
+            "SGLANG_ALLOW_GFX938_QUICK_ALLREDUCE", "0"
+        ).lower() in ("1", "true", "yes", "on"):
+            logger.warning(
+                "Enabling experimental QuickReduce on BW1100/gfx938. "
+                "Validate all-reduce numerics and full model accuracy before use."
+            )
+            return True
+        return False
     except Exception as e:
         logger.warning("Failed to determine ROCm for quick allreduce: %s", e)
         return False
@@ -209,6 +223,15 @@ class QuickAllReduce:
         self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
         self.create_shared_buffer()
         self.disabled = False
+        self._logged_first_selection = False
+        logger.info(
+            "QuickReduce initialized: world_size=%d, regime=%s, "
+            "cast_bf16_to_fp16=%s, max_size_bytes=%d",
+            self.world_size,
+            self.qr_quant_level.name,
+            bool(self.use_fp16_kernels),
+            self.qr_max_size,
+        )
 
     def create_shared_buffer(self):
         """
@@ -239,11 +262,23 @@ class QuickAllReduce:
         dtype = inp.dtype
         if self.use_fp16_kernels:
             dtype = torch.float16
-        return (
+        selected = (
             inp_size <= self.qr_max_size
             and inp_size
             >= self._QR_MIN_SIZE[(dtype, self.world_size)][self.qr_quant_level.value]
         )
+        if selected and not self._logged_first_selection:
+            logger.info(
+                "[AR] QuickReduce selected: bytes=%d, dtype=%s, world_size=%d, "
+                "regime=%s, cast_bf16_to_fp16=%s",
+                inp_size,
+                inp.dtype,
+                self.world_size,
+                self.qr_quant_level.name,
+                bool(self.use_fp16_kernels),
+            )
+            self._logged_first_selection = True
+        return selected
 
     def quick_all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor = None):
         """Performs an out-of-place custom quick all reduce."""
