@@ -1418,6 +1418,16 @@ class Envs:
     # graph shapes or kernel numerics. Defaults preserve the original policy.
     SGLANG_MINIMAX_DECODE_SCORE_TARGET_GRID = EnvInt(4096)
     SGLANG_MINIMAX_DECODE_SCORE_MAX_CHUNKS = EnvInt(256)
+    # Experimental MiniMax-M3 EAGLE TARGET_VERIFY score producer. Q2/Q3/Q4/Q5
+    # queries from the same request share each Index-K tile load while keeping
+    # independent causal masks, block scores, and Top-K selection. Keep this
+    # opt-in until gfx938 accuracy and end-to-end performance are gated.
+    SGLANG_OPT_USE_MINIMAX_MULTI_Q_VERIFY_SCORE = EnvBool(False)
+    # Standard-EP MiniMax-M3 keeps the shared MLP TP-sharded instead of
+    # incorrectly treating it as another full routed expert. During full
+    # decode-graph capture, issue that TP-sharded branch on a HIP side stream
+    # while router + routed experts stay on the main stream.
+    SGLANG_OPT_USE_MINIMAX_STANDARD_EP_SHARED_EXPERT_OVERLAP = EnvBool(False)
     # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
     # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.
     SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)

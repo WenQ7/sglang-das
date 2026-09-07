@@ -17,7 +17,7 @@ def test_minimax_router_gemv_rejects_cpu_tensors():
 
 
 def test_minimax_router_gemv_rejects_wrong_shape_before_launch():
-    hidden_states = torch.empty((17, 6144), dtype=torch.bfloat16)
+    hidden_states = torch.empty((65, 6144), dtype=torch.bfloat16)
     router_weight = torch.empty((128, 6144), dtype=torch.bfloat16)
 
     assert not can_use_minimax_router_gemv(hidden_states, router_weight)

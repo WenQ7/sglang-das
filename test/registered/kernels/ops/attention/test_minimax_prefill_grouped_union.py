@@ -7,7 +7,11 @@ the online-softmax state bit-for-bit unchanged.
 
 import pytest
 import torch
+import triton
 
+from sglang.kernels.ops.attention.minimax_sparse.prefill.flash_with_topk_idx import (
+    _prune_prefill_score_configs,
+)
 from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     build_query_group_topk_union,
     flash_prefill_with_gqa_share_sparse,
@@ -18,8 +22,47 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
+def test_prefill_score_override_is_limited_to_long_context_exact_q1(monkeypatch):
+    configs = [
+        triton.Config(
+            {"BLOCK_SIZE_Q": 64, "BLOCK_SIZE_K": 128},
+            num_warps=8,
+            num_stages=2,
+        ),
+        triton.Config(
+            {"BLOCK_SIZE_Q": 128, "BLOCK_SIZE_K": 128},
+            num_warps=8,
+            num_stages=3,
+        ),
+    ]
+    monkeypatch.setenv("SGLANG_MINIMAX_PREFILL_SCORE_CONFIG", "128,128,8,3")
+    monkeypatch.setenv("SGLANG_MINIMAX_PREFILL_SCORE_CONFIG_MIN_K", "131072")
+
+    short_or_grouped = _prune_prefill_score_configs(
+        configs,
+        {"Q_SAMPLE_INTERVAL": 16, "autotune_k_bucket": 262144},
+    )
+    short_k = _prune_prefill_score_configs(
+        configs,
+        {"Q_SAMPLE_INTERVAL": 1, "autotune_k_bucket": 1024},
+    )
+    winner_shape = _prune_prefill_score_configs(
+        configs,
+        {"Q_SAMPLE_INTERVAL": 1, "autotune_k_bucket": 262144},
+    )
+
+    assert short_or_grouped == configs
+    assert short_k == configs
+    assert winner_shape == [configs[1]]
+
+
+@pytest.mark.parametrize("fused_union", [False, True])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
-def test_grouped_union_preserves_q1_output_bit_exact():
+def test_grouped_union_preserves_q1_output_bit_exact(monkeypatch, fused_union):
+    monkeypatch.setenv(
+        "SGLANG_MINIMAX_PREFILL_FUSED_TOPK_UNION",
+        "1" if fused_union else "0",
+    )
     torch.manual_seed(7)
     device = torch.device("cuda")
 
@@ -79,8 +122,18 @@ def test_grouped_union_preserves_q1_output_bit_exact():
             if len(selected) >= topk:
                 break
             selected.add(candidate)
-        rows.append(sorted(selected)[: topk - 1] + [seq_len // sparse_block_size])
-    per_query_topk = torch.tensor(rows, device=device, dtype=torch.int32).unsqueeze(0)
+        row = sorted(selected)[: topk - 1] + [seq_len // sparse_block_size]
+        # AITER Top-K emits score-ranked ids.  The fused producer/union path
+        # deliberately skips the old standalone id-sort kernel, so exercise
+        # that production contract instead of accidentally validating only an
+        # already-sorted input.
+        rows.append(row[::2] + row[1::2])
+    unsorted_topk = torch.tensor(rows, device=device, dtype=torch.int32).unsqueeze(0)
+    sorted_topk = torch.sort(unsorted_topk, dim=-1).values
+    # Legacy production performs a separate id-sort before union.  The fused
+    # path must accept AITER's unsorted result and establish the same in-place
+    # contract itself.
+    per_query_topk = unsorted_topk.clone() if fused_union else sorted_topk.clone()
 
     q1_cu_seqblocks = torch.tensor(
         [0, num_queries], device=device, dtype=torch.int32
@@ -92,7 +145,7 @@ def test_grouped_union_preserves_q1_output_bit_exact():
         sink=None,
         req_to_token=req_to_token,
         slot_ids=slot_ids,
-        topk_idx=per_query_topk,
+        topk_idx=sorted_topk,
         block_size_q=1,
         block_size_k=sparse_block_size,
         cu_seqlens=cu_seqlens,
@@ -115,6 +168,7 @@ def test_grouped_union_preserves_q1_output_bit_exact():
         max_union=grouped_q * topk,
         return_query_mask=True,
     )
+    assert torch.equal(per_query_topk, sorted_topk)
     grouped = flash_prefill_with_gqa_share_sparse(
         q=q,
         k_cache=k,

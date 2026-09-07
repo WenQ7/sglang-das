@@ -142,6 +142,160 @@ def _compact_query_group_union_kernel(
     tl.store(overflow_ptr + pid_h * num_groups + pid_g, unique_count > MAX_UNION)
 
 
+@triton.jit
+def _fused_query_group_topk_union_kernel(
+    topk_ptr,
+    membership_ptr,
+    union_ptr,
+    query_mask_ptr,
+    overflow_ptr,
+    cu_seqlens_q,
+    cu_seqblocks_q,
+    num_heads,
+    stride_th,
+    stride_tn,
+    stride_tk,
+    stride_mh,
+    stride_mg,
+    stride_mb,
+    stride_uh,
+    stride_ug,
+    stride_uk,
+    stride_qmh,
+    stride_qmg,
+    stride_qmu,
+    num_groups,
+    max_num_blocks,
+    TOPK: tl.constexpr,
+    BLOCK_SIZE_Q: tl.constexpr,
+    FLAT_SIZE: tl.constexpr,
+    BLOCK_MAX: tl.constexpr,
+    MAX_UNION: tl.constexpr,
+    BUILD_QUERY_MASK: tl.constexpr,
+):
+    """Build one grouped Top-K union without intermediate kernel launches.
+
+    A single program owns one (batch, KV head, query group), so it can clear
+    its scratch row, scatter all per-query Top-K ids, and compact the row after
+    workgroup barriers.  In particular, the input ids do not need to be sorted:
+    compaction walks block ids in increasing order and therefore preserves the
+    sparse-attention consumer's sorted-union contract.
+    """
+
+    pid_q = tl.program_id(0)
+    pid_bh = tl.program_id(1)
+    pid_b = pid_bh // num_heads
+    pid_h = pid_bh % num_heads
+    q_start = tl.load(cu_seqlens_q + pid_b)
+    q_len = tl.load(cu_seqlens_q + pid_b + 1) - q_start
+    q_block_start = tl.load(cu_seqblocks_q + pid_b)
+    q_block_len = tl.load(cu_seqblocks_q + pid_b + 1) - q_block_start
+    group = q_block_start + pid_q
+
+    block_id = tl.arange(0, BLOCK_MAX)
+    scratch = (
+        membership_ptr
+        + pid_h * stride_mh
+        + group * stride_mg
+        + block_id * stride_mb
+    )
+    valid_group = pid_q < q_block_len
+    tl.store(scratch, 0, mask=valid_group & (block_id < max_num_blocks))
+    tl.debug_barrier()
+
+    off = tl.arange(0, FLAT_SIZE)
+    row = off // TOPK
+    col = off % TOPK
+    valid = valid_group & (row < BLOCK_SIZE_Q) & (
+        pid_q * BLOCK_SIZE_Q + row < q_len
+    )
+    values = tl.load(
+        topk_ptr
+        + pid_h * stride_th
+        + (q_start + pid_q * BLOCK_SIZE_Q + row) * stride_tn
+        + col * stride_tk,
+        mask=valid,
+        other=-1,
+    ).to(tl.int32)
+    # AITER returns score-ranked ids, whereas the established sparse-main
+    # numerical contract consumes every query row in ascending block-id order.
+    # Sort all rows owned by this query-group program and write them back in
+    # place.  This replaces the former standalone sort launch while preserving
+    # the exact Q1 accumulation order used by accuracy baselines.
+    values_2d = tl.reshape(values, (BLOCK_SIZE_Q, TOPK))
+    values_2d = tl.sort(values_2d, dim=1, descending=False)
+    values = tl.reshape(values_2d, (FLAT_SIZE,))
+    tl.store(
+        topk_ptr
+        + pid_h * stride_th
+        + (q_start + pid_q * BLOCK_SIZE_Q + row) * stride_tn
+        + col * stride_tk,
+        values,
+        mask=valid,
+    )
+    valid = valid & (values >= 0) & (values < max_num_blocks)
+    value_scratch = (
+        membership_ptr
+        + pid_h * stride_mh
+        + group * stride_mg
+        + values * stride_mb
+    )
+    if BUILD_QUERY_MASK:
+        tl.atomic_or(value_scratch, 1 << row, mask=valid)
+    else:
+        tl.atomic_or(value_scratch, 1, mask=valid)
+    tl.debug_barrier()
+
+    membership = tl.load(
+        scratch,
+        mask=valid_group & (block_id < max_num_blocks),
+        other=0,
+    )
+    present = membership != 0
+    union_pos = tl.cumsum(present.to(tl.int32), axis=0) - 1
+    tl.store(
+        union_ptr
+        + pid_h * stride_uh
+        + group * stride_ug
+        + union_pos * stride_uk,
+        block_id,
+        mask=valid_group & present & (union_pos < MAX_UNION),
+    )
+    if BUILD_QUERY_MASK:
+        tl.store(
+            query_mask_ptr
+            + pid_h * stride_qmh
+            + group * stride_qmg
+            + union_pos * stride_qmu,
+            membership,
+            mask=valid_group & present & (union_pos < MAX_UNION),
+        )
+    unique_count = tl.sum(present.to(tl.int32), axis=0)
+    off_u = tl.arange(0, MAX_UNION)
+    tl.store(
+        union_ptr
+        + pid_h * stride_uh
+        + group * stride_ug
+        + off_u * stride_uk,
+        -1,
+        mask=valid_group & (off_u >= unique_count),
+    )
+    if BUILD_QUERY_MASK:
+        tl.store(
+            query_mask_ptr
+            + pid_h * stride_qmh
+            + group * stride_qmg
+            + off_u * stride_qmu,
+            0,
+            mask=valid_group & (off_u >= unique_count),
+        )
+    tl.store(
+        overflow_ptr + pid_h * num_groups + group,
+        unique_count > MAX_UNION,
+        mask=valid_group,
+    )
+
+
 def build_query_group_topk_union(
     topk_idx: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
@@ -151,6 +305,7 @@ def build_query_group_topk_union(
     max_num_blocks: int,
     max_union: int = 256,
     return_query_mask: bool = False,
+    workspace: Optional[dict[str, torch.Tensor]] = None,
 ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Compact per-query Top-K rows into one sorted union per query group."""
 
@@ -175,73 +330,161 @@ def build_query_group_topk_union(
         raise ValueError(f"max_union must be a power of two, got {max_union}")
     if return_query_mask and block_size_q > 31:
         raise ValueError("query-membership bitmask supports block_size_q <= 31")
-    membership = torch.zeros(
-        (num_heads, all_groups, max_num_blocks),
-        dtype=torch.int32,
-        device=topk_idx.device,
+    fused_union = (
+        os.environ.get("SGLANG_MINIMAX_PREFILL_FUSED_TOPK_UNION", "0") == "1"
     )
-    union = torch.full(
-        (num_heads, all_groups, max_union),
-        -1,
-        dtype=torch.int32,
-        device=topk_idx.device,
-    )
-    overflow = torch.zeros(
-        (num_heads, all_groups), dtype=torch.bool, device=topk_idx.device
-    )
-    query_mask = (
-        torch.zeros(
+    if fused_union and flat_size != block_size_q * topk:
+        raise ValueError(
+            "fused grouped union requires a power-of-two Top-K so each query "
+            f"row can be sorted in-kernel, got topk={topk}"
+        )
+    if workspace is None:
+        membership = torch.empty(
+            (num_heads, all_groups, max_num_blocks),
+            dtype=torch.int32,
+            device=topk_idx.device,
+        )
+        union = torch.empty(
             (num_heads, all_groups, max_union),
             dtype=torch.int32,
             device=topk_idx.device,
         )
-        if return_query_mask
-        else None
-    )
+        overflow = torch.empty(
+            (num_heads, all_groups), dtype=torch.bool, device=topk_idx.device
+        )
+        query_mask = (
+            torch.empty(
+                (num_heads, all_groups, max_union),
+                dtype=torch.int32,
+                device=topk_idx.device,
+            )
+            if return_query_mask
+            else None
+        )
+    else:
+        expected = {
+            "membership": ((num_heads, all_groups, max_num_blocks), torch.int32),
+            "union": ((num_heads, all_groups, max_union), torch.int32),
+            "overflow": ((num_heads, all_groups), torch.bool),
+        }
+        for name, (shape, dtype) in expected.items():
+            value = workspace.get(name)
+            if (
+                value is None
+                or value.shape != shape
+                or value.dtype != dtype
+                or value.device != topk_idx.device
+                or not value.is_contiguous()
+            ):
+                raise ValueError(
+                    f"invalid grouped-union workspace[{name!r}]: "
+                    f"shape={getattr(value, 'shape', None)} "
+                    f"dtype={getattr(value, 'dtype', None)}"
+                )
+        membership = workspace["membership"]
+        union = workspace["union"]
+        overflow = workspace["overflow"]
+        if return_query_mask:
+            query_mask = workspace.get("query_mask")
+            if (
+                query_mask is None
+                or query_mask.shape != (num_heads, all_groups, max_union)
+                or query_mask.dtype != torch.int32
+                or query_mask.device != topk_idx.device
+                or not query_mask.is_contiguous()
+            ):
+                raise ValueError("invalid grouped-union workspace['query_mask']")
+        else:
+            query_mask = None
     batch_size = cu_seqlens_q.shape[0] - 1
-    max_groups = max(1, triton.cdiv(topk_idx.shape[1], block_size_q))
-    _scatter_query_group_union_kernel[(max_groups, batch_size * num_heads)](
-        topk_idx,
-        membership,
-        cu_seqlens_q,
-        cu_seqblocks_q,
-        num_heads,
-        topk_idx.stride(0),
-        topk_idx.stride(1),
-        topk_idx.stride(2),
-        membership.stride(0),
-        membership.stride(1),
-        membership.stride(2),
-        max_num_blocks,
-        TOPK=topk,
-        BLOCK_SIZE_Q=block_size_q,
-        FLAT_SIZE=flat_size,
-        BUILD_QUERY_MASK=return_query_mask,
-        num_warps=4,
-        num_stages=2,
-    )
-    _compact_query_group_union_kernel[(all_groups, num_heads)](
-        membership,
-        union,
-        query_mask,
-        overflow,
-        all_groups,
-        max_num_blocks,
-        membership.stride(0),
-        membership.stride(1),
-        membership.stride(2),
-        union.stride(0),
-        union.stride(1),
-        union.stride(2),
-        query_mask.stride(0) if query_mask is not None else 0,
-        query_mask.stride(1) if query_mask is not None else 0,
-        query_mask.stride(2) if query_mask is not None else 0,
-        BLOCK_MAX=triton.next_power_of_2(max_num_blocks),
-        MAX_UNION=max_union,
-        BUILD_QUERY_MASK=return_query_mask,
-        num_warps=8,
-        num_stages=2,
-    )
+    # all_groups is the authoritative number of q-block groups. Using
+    # ceil(total_q / block_size_q) is wrong for non-power-of-two group sizes
+    # such as MTP G=3 (block_size_q=4).
+    max_groups = max(1, int(all_groups))
+    if fused_union:
+        _fused_query_group_topk_union_kernel[(
+            max_groups,
+            batch_size * num_heads,
+        )](
+            topk_idx,
+            membership,
+            union,
+            query_mask,
+            overflow,
+            cu_seqlens_q,
+            cu_seqblocks_q,
+            num_heads,
+            topk_idx.stride(0),
+            topk_idx.stride(1),
+            topk_idx.stride(2),
+            membership.stride(0),
+            membership.stride(1),
+            membership.stride(2),
+            union.stride(0),
+            union.stride(1),
+            union.stride(2),
+            query_mask.stride(0) if query_mask is not None else 0,
+            query_mask.stride(1) if query_mask is not None else 0,
+            query_mask.stride(2) if query_mask is not None else 0,
+            all_groups,
+            max_num_blocks,
+            TOPK=topk,
+            BLOCK_SIZE_Q=block_size_q,
+            FLAT_SIZE=flat_size,
+            BLOCK_MAX=triton.next_power_of_2(max_num_blocks),
+            MAX_UNION=max_union,
+            BUILD_QUERY_MASK=return_query_mask,
+            num_warps=8,
+            num_stages=1,
+        )
+    else:
+        membership.zero_()
+        union.fill_(-1)
+        overflow.zero_()
+        if query_mask is not None:
+            query_mask.zero_()
+        _scatter_query_group_union_kernel[(max_groups, batch_size * num_heads)](
+            topk_idx,
+            membership,
+            cu_seqlens_q,
+            cu_seqblocks_q,
+            num_heads,
+            topk_idx.stride(0),
+            topk_idx.stride(1),
+            topk_idx.stride(2),
+            membership.stride(0),
+            membership.stride(1),
+            membership.stride(2),
+            max_num_blocks,
+            TOPK=topk,
+            BLOCK_SIZE_Q=block_size_q,
+            FLAT_SIZE=flat_size,
+            BUILD_QUERY_MASK=return_query_mask,
+            num_warps=4,
+            num_stages=2,
+        )
+        _compact_query_group_union_kernel[(all_groups, num_heads)](
+            membership,
+            union,
+            query_mask,
+            overflow,
+            all_groups,
+            max_num_blocks,
+            membership.stride(0),
+            membership.stride(1),
+            membership.stride(2),
+            union.stride(0),
+            union.stride(1),
+            union.stride(2),
+            query_mask.stride(0) if query_mask is not None else 0,
+            query_mask.stride(1) if query_mask is not None else 0,
+            query_mask.stride(2) if query_mask is not None else 0,
+            BLOCK_MAX=triton.next_power_of_2(max_num_blocks),
+            MAX_UNION=max_union,
+            BUILD_QUERY_MASK=return_query_mask,
+            num_warps=8,
+            num_stages=2,
+        )
     if os.environ.get("SGLANG_MINIMAX_PREFILL_UNION_STRICT_CHECK", "0") == "1":
         if bool(overflow.any().item()):
             raise RuntimeError(
@@ -469,10 +712,11 @@ def _gqa_share_sparse_fwd_kernel(
                 mask=pos_mask,
                 other=0,
             ).to(tl.int64)
+            slots = (slots + max_slots) % max_slots  # safety against negative
             if DCP_SIZE > 1:
                 pos_mask = pos_mask & (pos % DCP_SIZE == DCP_RANK)
                 slots = slots // DCP_SIZE
-            slots = (slots + max_slots) % max_slots  # safety against negative
+                slots = (slots + max_slots) % max_slots
             # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
             k = tl.load(
                 k_cache_ptr

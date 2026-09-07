@@ -66,7 +66,11 @@ def can_use_minimax_router_gemv(
         and router_weight.is_cuda
         and hidden_states.dim() == 2
         and router_weight.dim() == 2
-        and 0 < hidden_states.shape[0] <= 16
+        # Target verify gathers the DP4 local Q2 rows before the MoE and
+        # therefore presents M=32 at the strict c16 workload.  The specialized
+        # kernel remains substantially faster than rocBLAS through M=64 on
+        # gfx938; stopping at 16 made every sparse layer silently fall back.
+        and 0 < hidden_states.shape[0] <= 64
         and hidden_states.shape[1] == router_weight.shape[1]
         and router_weight.shape[0] == 128
         and hidden_states.shape[1] == 6144
@@ -88,7 +92,7 @@ def minimax_router_gemv(
     if not can_use_minimax_router_gemv(hidden_states, router_weight):
         raise ValueError(
             "MiniMax router GEMV requires CUDA/HIP contiguous BF16 tensors "
-            "with M=1..16, N=128 and K=6144"
+            "with M=1..64, N=128 and K=6144"
         )
     if block_k not in (128, 256, 512, 1024):
         raise ValueError(f"Unsupported MiniMax router GEMV block_k={block_k}")
@@ -98,7 +102,10 @@ def minimax_router_gemv(
     num_tokens = hidden_states.shape[0]
     num_experts = router_weight.shape[0]
     hidden_size = hidden_states.shape[1]
-    tokens_per_program = min(triton.next_power_of_2(num_tokens), 4)
+    # Reuse each router-weight load across up to eight rows.  At the important
+    # M=32 verify shape this cuts the grid/load duplication in half while
+    # retaining enough programs to fill gfx938.
+    tokens_per_program = min(triton.next_power_of_2(num_tokens), 8)
     output = torch.empty(
         (num_tokens, num_experts),
         dtype=torch.float32,

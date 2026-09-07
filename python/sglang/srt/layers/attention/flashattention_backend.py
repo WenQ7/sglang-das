@@ -193,6 +193,16 @@ class FlashAttentionBackend(AttentionBackend):
         # seq_lens_cpu / seq_lens_sum D2H sync is ever needed.
         self.needs_cpu_seq_lens = False
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
+        if hcu_flash:
+            if torch.version.hip is None:
+                raise ValueError("hcu_fa is only available on HIP/HCU platforms.")
+            if self.use_mla:
+                raise ValueError("hcu_fa currently supports MHA/GQA models, not MLA.")
+            if self.page_size != 64:
+                raise ValueError(
+                    "hcu_fa on BW1100 currently requires --page-size 64; got "
+                    f"{self.page_size}."
+                )
         # Unified pool: req_to_token holds VIRTUAL ids but the MLA per-layer views
         # are DENSE, so every page_table needs remapping. MLA-only -- the MHA/SWA
         # sub-pools keep the strided envelope layout FA3 cannot read at all.
@@ -1414,7 +1424,7 @@ class FlashAttentionBackend(AttentionBackend):
                 def _fa_cp_attn(
                     q_chunk, cu_seqlens_q_cp, cache_seqlens_cp, max_seqlen_q_cp
                 ):
-                    return flash_attn_with_kvcache(
+                    return self.flash_attn_with_kvcache(
                         q=q_chunk,
                         k_cache=key_cache,
                         v_cache=value_cache,
@@ -1490,7 +1500,7 @@ class FlashAttentionBackend(AttentionBackend):
                     else:
                         metadata.fa_skip_cu_seqlens_q = cu_seqlens_q
                         metadata.fa_skip_max_seqlen_q = max_seqlen_q
-                result = flash_attn_varlen_func(
+                result = self.flash_attn_varlen_func(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
                     v=v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
@@ -1507,7 +1517,7 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
             else:
-                result = flash_attn_with_kvcache(
+                result = self.flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -1529,7 +1539,7 @@ class FlashAttentionBackend(AttentionBackend):
 
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
-                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
+                o_expand, softmax_lse_expand, *rest_expand = self.flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     # Here metadata_expand.page_table is not divided with page_size.
                     # This is because we loose the fine control of  what token to attend,
@@ -1578,7 +1588,7 @@ class FlashAttentionBackend(AttentionBackend):
                     assert chunk_idx >= 0
 
                     assert forward_batch.mha_return_lse
-                    output = flash_attn_varlen_func(
+                    output = self.flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
@@ -1605,7 +1615,7 @@ class FlashAttentionBackend(AttentionBackend):
                         if not forward_batch.mha_one_shot
                         else metadata.max_seq_len_k
                     )
-                    output = flash_attn_varlen_func(
+                    output = self.flash_attn_varlen_func(
                         q=q.view(-1, layer.tp_q_head_num, layer.head_dim),
                         k=k.view(-1, layer.tp_k_head_num, layer.head_dim).to(q.dtype),
                         v=v.view(-1, layer.tp_k_head_num, layer.v_head_dim).to(q.dtype),
@@ -1676,7 +1686,7 @@ class FlashAttentionBackend(AttentionBackend):
                     ):
                         q_nope_chunk = q_chunk[..., : layer.v_head_dim]
                         q_rope_chunk = q_chunk[..., layer.v_head_dim :]
-                        return flash_attn_with_kvcache(
+                        return self.flash_attn_with_kvcache(
                             q=q_rope_chunk,
                             qv=q_nope_chunk,
                             k_cache=k_rope_cache,
@@ -1712,7 +1722,7 @@ class FlashAttentionBackend(AttentionBackend):
                             forward_batch, q_fused, self.device, _mla_cp_attn
                         )
                 else:
-                    result = flash_attn_with_kvcache(
+                    result = self.flash_attn_with_kvcache(
                         q=q_rope,
                         k_cache=k_rope_cache,
                         v_cache=c_kv_cache,
@@ -1734,7 +1744,7 @@ class FlashAttentionBackend(AttentionBackend):
                     if use_cascade_attn:
                         o, softmax_lse, *rest = result
                         o_expand, softmax_lse_expand, *rest_expand = (
-                            flash_attn_with_kvcache(
+                            self.flash_attn_with_kvcache(
                                 q=q_rope,
                                 k_cache=k_rope_cache,
                                 v_cache=c_kv_cache,
@@ -1909,7 +1919,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # Always use non-chunked logic for cross-attention
                 if self._decode_uses_static_max_seqlen_k:
                     kwargs["max_seqlen_k"] = metadata.encoder_max_seq_len_k
-                o = flash_attn_with_kvcache(
+                o = self.flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -1930,7 +1940,7 @@ class FlashAttentionBackend(AttentionBackend):
                 # Use chunked (local) attention batching for self-attention
                 if self._decode_uses_static_max_seqlen_k:
                     kwargs["max_seqlen_k"] = local_attn_metadata.local_max_seq_len
-                o = flash_attn_with_kvcache(
+                o = self.flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -1985,7 +1995,7 @@ class FlashAttentionBackend(AttentionBackend):
                     sched_meta = metadata.scheduler_metadata
                 if self._decode_uses_static_max_seqlen_k:
                     kwargs["max_seqlen_k"] = metadata.max_seq_len_k
-                result = flash_attn_with_kvcache(
+                result = self.flash_attn_with_kvcache(
                     q=q_reshaped,
                     k_cache=key_cache,
                     v_cache=value_cache,
@@ -2017,7 +2027,7 @@ class FlashAttentionBackend(AttentionBackend):
                             self.forward_metadata_spec_decode_expand.max_seq_len_k
                         )
                     o_expand, softmax_lse_expand, *rest_expand = (
-                        flash_attn_with_kvcache(
+                        self.flash_attn_with_kvcache(
                             q=q_reshaped,
                             k_cache=key_cache,
                             v_cache=value_cache,
@@ -2070,7 +2080,7 @@ class FlashAttentionBackend(AttentionBackend):
                 q_rope = q_all[:, :, layer.v_head_dim :]
             max_seqlen_q = metadata.max_seq_len_q
 
-            result = flash_attn_with_kvcache(
+            result = self.flash_attn_with_kvcache(
                 q=q_rope,
                 k_cache=k_rope_cache,
                 v_cache=c_kv_cache,
@@ -2091,7 +2101,7 @@ class FlashAttentionBackend(AttentionBackend):
             )
             if use_cascade_attn:
                 o, softmax_lse, *rest = result
-                o_expand, softmax_lse_expand, *rest_expand = flash_attn_with_kvcache(
+                o_expand, softmax_lse_expand, *rest_expand = self.flash_attn_with_kvcache(
                     q=q_rope,
                     k_cache=k_rope_cache,
                     v_cache=c_kv_cache,

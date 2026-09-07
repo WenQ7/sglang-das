@@ -22,6 +22,61 @@ from ..common.utils import (
 _debug_topk_capture_done = False
 
 
+def _prune_prefill_score_configs(configs, named_args, **kwargs):
+    """Pin the long-context exact-Q1 score tile when explicitly requested.
+
+    Triton's isolated autotune does not model the two concurrent CP zigzag
+    streams.  The override is therefore applied only to exact-Q1 index scoring
+    at or above a configurable K bucket; short/ragged and grouped-score shapes
+    keep the regular autotune search.
+    """
+
+    raw = os.environ.get("SGLANG_MINIMAX_PREFILL_SCORE_CONFIG", "").strip()
+    if not raw:
+        return configs
+    try:
+        requested = tuple(int(part.strip()) for part in raw.split(","))
+    except ValueError as exc:
+        raise ValueError(
+            "SGLANG_MINIMAX_PREFILL_SCORE_CONFIG must be "
+            "BLOCK_Q,BLOCK_K,NUM_WARPS,NUM_STAGES"
+        ) from exc
+    if len(requested) != 4:
+        raise ValueError(
+            "SGLANG_MINIMAX_PREFILL_SCORE_CONFIG must contain exactly four "
+            "comma-separated integers"
+        )
+    selected = [
+        config
+        for config in configs
+        if (
+            config.kwargs.get("BLOCK_SIZE_Q"),
+            config.kwargs.get("BLOCK_SIZE_K"),
+            config.num_warps,
+            config.num_stages,
+        )
+        == requested
+    ]
+    if not selected:
+        raise ValueError(
+            "SGLANG_MINIMAX_PREFILL_SCORE_CONFIG does not match an available "
+            f"candidate: {raw!r}"
+        )
+    min_k_bucket = int(
+        os.environ.get("SGLANG_MINIMAX_PREFILL_SCORE_CONFIG_MIN_K", "131072")
+    )
+    if min_k_bucket < 0:
+        raise ValueError(
+            "SGLANG_MINIMAX_PREFILL_SCORE_CONFIG_MIN_K must be non-negative"
+        )
+    if (
+        int(named_args.get("Q_SAMPLE_INTERVAL", 1)) != 1
+        or int(named_args.get("autotune_k_bucket", 0)) < min_k_bucket
+    ):
+        return configs
+    return selected
+
+
 def _maybe_capture_debug_topk(
     *,
     score: torch.Tensor,
@@ -225,7 +280,9 @@ def _maybe_capture_debug_topk(
         "DISABLE_INDEX_VALUE",
         "COMPACT_SCORE",
         "Q_SAMPLE_INTERVAL",
+        "PREPARE_EXTERNAL_TOPK",
     ],
+    prune_configs_by={"early_config_prune": _prune_prefill_score_configs},
 )
 @triton.jit
 def _flash_attn_fwd_with_block_score_kernel(
@@ -293,6 +350,11 @@ def _flash_attn_fwd_with_block_score_kernel(
     Q_SAMPLE_OFFSET: tl.constexpr,
     DCP_SIZE: tl.constexpr,
     DCP_RANK: tl.constexpr,
+    PREPARE_EXTERNAL_TOPK: tl.constexpr,
+    FINALIZE_EXTERNAL_TOPK: tl.constexpr,
+    INIT_BLOCKS: tl.constexpr,
+    LOCAL_BLOCKS: tl.constexpr,
+    MAX_SEQBLOCK_K: tl.constexpr,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -394,10 +456,11 @@ def _flash_attn_fwd_with_block_score_kernel(
             mask=pos_mask,
             other=0,
         ).to(tl.int64)
+        slots = (slots + max_slots) % max_slots  # safety against negative
         if DCP_SIZE > 1:
             pos_mask = pos_mask & (pos % DCP_SIZE == DCP_RANK)
             slots = slots // DCP_SIZE
-        slots = (slots + max_slots) % max_slots  # safety against negative
+            slots = (slots + max_slots) % max_slots
         # k shape: [BLOCK_SIZE_KD, BLOCK_SIZE_K] (transposed for tl.dot)
         k = tl.load(
             k_cache_ptr
@@ -445,6 +508,31 @@ def _flash_attn_fwd_with_block_score_kernel(
             noise = tl.clamp(noise, min=1e-9, max=1 - 1e-9)  # avoid log(0)
             noise = -tl.log(-tl.log(noise)) * 1.4426950409
             score += noise
+        if PREPARE_EXTERNAL_TOPK:
+            # AITER Top-K does not receive the ragged/forced-block metadata
+            # understood by the native selector. Materialize that contract
+            # while the score tile is still in registers instead of launching
+            # a second kernel that reads and rewrites the whole FP32 workspace.
+            score_block = i // block_size + off_bpk[None, :]
+            valid_blocks = (
+                prefix_len
+                + q_pos[:, None]
+                + block_size
+            ) // block_size
+            valid_score = score_block < valid_blocks
+            score = tl.where(valid_score, score, -1e30)
+            score = tl.where(
+                valid_score & (score_block < INIT_BLOCKS), 1e30, score
+            )
+            score = tl.where(
+                valid_score
+                & (
+                    score_block
+                    >= tl.maximum(0, valid_blocks - LOCAL_BLOCKS)
+                ),
+                1e29,
+                score,
+            )
         if COMPACT_SCORE:
             score_ptrs = (
                 score_ptr
@@ -493,6 +581,38 @@ def _flash_attn_fwd_with_block_score_kernel(
         # update ptrs
         if not COMPACT_SCORE:
             s_ptrs = tl.advance(s_ptrs, (0, BLOCKS_PER_K_BLOCK))
+    if PREPARE_EXTERNAL_TOPK and FINALIZE_EXTERNAL_TOPK:
+        # The producer loop stops at the largest causal K tile. AITER scans the
+        # complete fixed-width row, so initialize only the unwritten tail. This
+        # is write-only and stays in the producer launch; the former prepare
+        # kernel loaded these undefined bytes before replacing them with -inf.
+        for tail_block in tl.range(0, MAX_SEQBLOCK_K, BLOCKS_PER_K_BLOCK):
+            tail_ids = tail_block + off_bpk[None, :]
+            valid_blocks = (
+                prefix_len
+                + q_pos[:, None]
+                + block_size
+            ) // block_size
+            tail_mask = (
+                (q_pos[:, None] < q_len)
+                & (tail_ids >= valid_blocks)
+                & (tail_ids < MAX_SEQBLOCK_K)
+            )
+            if COMPACT_SCORE:
+                tail_ptrs = (
+                    score_ptr
+                    + pid_h * stride_s_h
+                    + (block_start + q_rows[:, None]) * stride_s_q
+                    + tail_ids * stride_s_k
+                )
+            else:
+                tail_ptrs = (
+                    score_ptr
+                    + pid_h * stride_s_h
+                    + (seq_start + q_rows[:, None]) * stride_s_q
+                    + tail_ids * stride_s_k
+                )
+            tl.store(tail_ptrs, -1e30, mask=tail_mask)
     if not DISABLE_INDEX_VALUE:
         # final scale
         acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
@@ -1015,6 +1135,7 @@ def flash_prefill_with_topk_index(
     dcp_size: int = 1,
     dcp_rank: int = 0,
     dcp_group=None,
+    sort_topk_ids: bool = True,
 ):
     assert score_type in (
         "max",
@@ -1094,6 +1215,18 @@ def flash_prefill_with_topk_index(
         )
     score_rows = all_seqblock_q if compact_score else total_q
     score_shape = (num_heads, score_rows, max_seqblock_k)
+    topk_backend = os.environ.get(
+        "SGLANG_MINIMAX_PREFILL_TOPK_BACKEND", "triton"
+    ).lower()
+    if topk_backend not in ("triton", "aiter"):
+        raise ValueError(
+            "SGLANG_MINIMAX_PREFILL_TOPK_BACKEND must be 'triton' or 'aiter', "
+            f"got {topk_backend!r}"
+        )
+    fuse_aiter_prepare = (
+        topk_backend == "aiter"
+        and os.environ.get("SGLANG_MINIMAX_FUSE_AITER_TOPK_PREPARE", "1") == "1"
+    )
     # The producer writes every score that _topk_index_kernel is allowed to
     # read: its per-row ``valid_blocks`` is no larger than the producer's
     # causal ``hi``.  Initializing the entire temporary to -inf therefore adds
@@ -1109,77 +1242,78 @@ def flash_prefill_with_topk_index(
             device=q.device,
         )
 
-    # launch kernel
+    # Launch the score producer. A gfx938 AOT HIP/MFMA experiment was removed
+    # after the real winner shape measured 3x slower than this Triton path.
     def grid(META):
         q_extent = max_seqblock_q if compact_score else max_seqlen_q
-        return (triton.cdiv(q_extent, META["BLOCK_SIZE_Q"]), batch_size * num_heads)
+        return (
+            triton.cdiv(q_extent, META["BLOCK_SIZE_Q"]),
+            batch_size * num_heads,
+        )
 
     _flash_attn_fwd_with_block_score_kernel[grid](
-        q,
-        k_cache,
-        v_cache,
-        sink,
-        o,
-        score,
-        req_to_token,
-        cu_seqlens,
-        cu_seqblocks_q,
-        seq_lens,
-        prefix_lens,
-        slot_ids,
-        max_slots,
-        num_heads,
-        gqa_group_size,
-        qk_head_dim,
-        v_head_dim,
-        triton.next_power_of_2(max_seqlen_q),
-        triton.next_power_of_2(max_seqlen_k),
-        block_size_k,
-        sm_scale,
-        k_scale,
-        v_scale,
-        False,
-        1,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        k_cache.stride(2),
-        v_cache.stride(0) if v_cache is not None else 0,
-        v_cache.stride(1) if v_cache is not None else 0,
-        v_cache.stride(2) if v_cache is not None else 0,
-        sink.stride(0) if sink is not None else 0,
-        sink.stride(1) if sink is not None else 0,
-        o.stride(0) if o is not None else 0,
-        o.stride(1) if o is not None else 0,
-        o.stride(2) if o is not None else 0,
-        score.stride(0),
-        score.stride(1),
-        score.stride(2),
-        req_to_token.stride(0),
-        SCORE_TYPE=score_type,
-        DISABLE_INDEX_VALUE=disable_index_value,
-        IS_FP8=is_fp8,
-        COMPACT_SCORE=compact_score,
-        Q_SAMPLE_INTERVAL=block_size_q if compact_score else 1,
-        Q_SAMPLE_OFFSET=sample_offset,
-        DCP_SIZE=dcp_size,
-        DCP_RANK=dcp_rank,
-    )
+            q,
+            k_cache,
+            v_cache,
+            sink,
+            o,
+            score,
+            req_to_token,
+            cu_seqlens,
+            cu_seqblocks_q,
+            seq_lens,
+            prefix_lens,
+            slot_ids,
+            max_slots,
+            num_heads,
+            gqa_group_size,
+            qk_head_dim,
+            v_head_dim,
+            triton.next_power_of_2(max_seqlen_q),
+            triton.next_power_of_2(max_seqlen_k),
+            block_size_k,
+            sm_scale,
+            k_scale,
+            v_scale,
+            False,
+            1,
+            q.stride(0),
+            q.stride(1),
+            q.stride(2),
+            k_cache.stride(0),
+            k_cache.stride(1),
+            k_cache.stride(2),
+            v_cache.stride(0) if v_cache is not None else 0,
+            v_cache.stride(1) if v_cache is not None else 0,
+            v_cache.stride(2) if v_cache is not None else 0,
+            sink.stride(0) if sink is not None else 0,
+            sink.stride(1) if sink is not None else 0,
+            o.stride(0) if o is not None else 0,
+            o.stride(1) if o is not None else 0,
+            o.stride(2) if o is not None else 0,
+            score.stride(0),
+            score.stride(1),
+            score.stride(2),
+            req_to_token.stride(0),
+            SCORE_TYPE=score_type,
+            DISABLE_INDEX_VALUE=disable_index_value,
+            IS_FP8=is_fp8,
+            COMPACT_SCORE=compact_score,
+            Q_SAMPLE_INTERVAL=block_size_q if compact_score else 1,
+            Q_SAMPLE_OFFSET=sample_offset,
+            DCP_SIZE=dcp_size,
+            DCP_RANK=dcp_rank,
+            PREPARE_EXTERNAL_TOPK=fuse_aiter_prepare,
+            FINALIZE_EXTERNAL_TOPK=True,
+            INIT_BLOCKS=init_blocks,
+            LOCAL_BLOCKS=local_blocks,
+            MAX_SEQBLOCK_K=max_seqblock_k,
+        )
 
     if dcp_size > 1:
         score = merge_dcp_block_scores(score, dcp_group, dcp_size)
 
     # topk extraction kernel
-    topk_backend = os.environ.get(
-        "SGLANG_MINIMAX_PREFILL_TOPK_BACKEND", "triton"
-    ).lower()
-    if topk_backend not in ("triton", "aiter"):
-        raise ValueError(
-            "SGLANG_MINIMAX_PREFILL_TOPK_BACKEND must be 'triton' or 'aiter', "
-            f"got {topk_backend!r}"
-        )
     topk_idx = torch.empty(
         (num_heads, all_seqblock_q, coarse_topk),
         device=score.device,
@@ -1187,35 +1321,37 @@ def flash_prefill_with_topk_index(
     )
     if topk_backend == "aiter":
         # AITER's native HIP Top-K is substantially faster than the generic
-        # bitonic kernel on gfx938.  Materialize the ragged/forced score rules
-        # first, then sort the selected block IDs to retain the MSA consumer
-        # contract.  Keep this opt-in until end-to-end accuracy is validated.
-        prepare_block_size = 256
-        prepare_grid = (
-            triton.cdiv(max_seqblock_k, prepare_block_size),
-            max_seqblock_q,
-            batch_size * num_heads,
-        )
-        _prepare_score_for_external_topk_kernel[prepare_grid](
-            score,
-            cu_seqlens,
-            cu_seqblocks_q,
-            prefix_lens,
-            block_size_q,
-            sample_offset,
-            block_size_k,
-            init_blocks,
-            local_blocks,
-            max_seqblock_k,
-            score.stride(0),
-            score.stride(1),
-            score.stride(2),
-            NUM_HEADS=num_heads,
-            SCORES_COMPACT=compact_score,
-            BLOCK_SIZE_K=prepare_block_size,
-            num_warps=4,
-            num_stages=1,
-        )
+        # bitonic selector on gfx938. The producer above has already applied
+        # the exact ragged/forced-block rules and initialized its causal tail.
+        if not fuse_aiter_prepare:
+            # Differential/debug fallback retaining the former standalone
+            # prepare pass. Production defaults to producer fusion above.
+            prepare_block_size = 256
+            prepare_grid = (
+                triton.cdiv(max_seqblock_k, prepare_block_size),
+                max_seqblock_q,
+                batch_size * num_heads,
+            )
+            _prepare_score_for_external_topk_kernel[prepare_grid](
+                score,
+                cu_seqlens,
+                cu_seqblocks_q,
+                prefix_lens,
+                block_size_q,
+                sample_offset,
+                block_size_k,
+                init_blocks,
+                local_blocks,
+                max_seqblock_k,
+                score.stride(0),
+                score.stride(1),
+                score.stride(2),
+                NUM_HEADS=num_heads,
+                SCORES_COMPACT=compact_score,
+                BLOCK_SIZE_K=prepare_block_size,
+                num_warps=4,
+                num_stages=1,
+            )
         try:
             from aiter.ops.topk_plain import topk_plain as aiter_topk_plain
         except ImportError as exc:
@@ -1237,17 +1373,18 @@ def flash_prefill_with_topk_index(
             -1,
             1,
         )
-        sort_block_size = triton.next_power_of_2(coarse_topk)
-        _sort_external_topk_ids_kernel[(flat_idx.shape[0],)](
-            flat_idx,
-            flat_idx.shape[0],
-            coarse_topk,
-            flat_idx.stride(0),
-            flat_idx.stride(1),
-            BLOCK_SIZE_T=sort_block_size,
-            num_warps=1,
-            num_stages=1,
-        )
+        if sort_topk_ids:
+            sort_block_size = triton.next_power_of_2(coarse_topk)
+            _sort_external_topk_ids_kernel[(flat_idx.shape[0],)](
+                flat_idx,
+                flat_idx.shape[0],
+                coarse_topk,
+                flat_idx.stride(0),
+                flat_idx.stride(1),
+                BLOCK_SIZE_T=sort_block_size,
+                num_warps=1,
+                num_stages=1,
+            )
     else:
         grid = (max_seqblock_q, batch_size, num_heads)
         _topk_index_kernel[grid](

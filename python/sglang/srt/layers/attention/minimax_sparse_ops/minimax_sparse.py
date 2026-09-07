@@ -2,7 +2,7 @@
 
 import logging
 import os
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -153,62 +153,9 @@ def minimax_sparse_prefill(
             cu_seqlens, max_seqlen_q, block_size_q, block_size_k, seqlens_cpu
         )
 
-    # All seqlen is less than topk, use full attention
-    # Step 1: Flash attention with topk index (using index head)
-    idx_o, topk_idx = flash_prefill_with_topk_index(
-        q=idx_q,
-        k_cache=idx_k_cache,
-        v_cache=idx_v_cache,
-        sink=idx_sink,
-        req_to_token=req_to_token,
-        slot_ids=slot_ids,
-        cu_seqlens=cu_seqlens,
-        seq_lens=seq_lens,
-        prefix_lens=prefix_lens,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        block_size_q=block_size_q,
-        block_size_k=block_size_k,
-        topk=topk,
-        init_blocks=init_blocks,
-        local_blocks=local_blocks,
-        sm_scale=idx_sm_scale,
-        score_type=score_type,
-        disable_index_value=disable_index_value,
-        cu_seqblocks_q=cu_seqblocks_q,
-        max_seqblock_q=max_seqblock_q,
-        all_seqblock_q=all_seqblock_q,
-        q_scale=idx_q_scale,
-        k_scale=idx_k_scale,
-        v_scale=idx_v_scale,
-        dcp_size=dcp_size,
-        dcp_rank=dcp_rank,
-        dcp_group=dcp_group,
-    )
-    # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
-    num_idx_heads = idx_q.shape[1]
-    num_kv_heads = k_cache.shape[1]
-    idx_group_size = num_idx_heads // num_kv_heads
-    if idx_group_size > 1:
-        topk_idx = topk_index_reduce(
-            topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
-        )
-    q_for_main = (
-        dcp_group.all_gather(q.contiguous(), dim=1).contiguous()
-        if dcp_size > 1
-        else q
-    )
-    main_block_size_q = block_size_q
-    main_cu_seqblocks_q = cu_seqblocks_q
-    main_max_seqblock_q = max_seqblock_q
-    per_query_topk_idx = None
-    query_group_mask = None
     exact_grouped_main_q = int(
         os.environ.get("SGLANG_MINIMAX_PREFILL_EXACT_GROUPED_MAIN_Q", "1")
     )
-    # Query-sharded prefill CP passes a local max_seqlen_q (16K / CP8 = 2K).
-    # Selection thresholds describe the user-visible logical request, so use
-    # the pre-sharding length supplied by the backend when it is available.
     exact_grouped_main_query_len = (
         max_seqlen_q
         if logical_max_seqlen_q is None
@@ -246,18 +193,7 @@ def minimax_sparse_prefill(
         )
     while exact_grouped_main_q > max_block_size_q:
         exact_grouped_main_q //= 2
-
-    # Exact Q1 index selection and grouped main attention are independent.
-    # The indexer above still computes one score row and one exact Top-K set for
-    # every query.  Grouping only unions those already-final sets for the main
-    # attention kernel, whose per-query membership mask excludes every block
-    # not selected by that query.  Therefore this changes scheduling and KV
-    # reuse, not sparse-attention semantics.  Limit the optimization to the
-    # long cache-hit extend window by default: using it while constructing the
-    # 128K causal prefix changes a handful of BF16 reductions and then persists
-    # those differences in the KV cache.  A zero length bound disables that
-    # side of the range check.
-    if (
+    use_exact_grouped_main = (
         block_size_q == 1
         and exact_grouped_main_q > 1
         and (
@@ -269,8 +205,78 @@ def minimax_sparse_prefill(
             or exact_grouped_main_query_len <= exact_grouped_main_max_query_len
         )
         and dcp_size == 1
-        and topk_idx.shape[1] == q.shape[0]
-    ):
+    )
+    fused_topk_union = (
+        os.environ.get("SGLANG_MINIMAX_PREFILL_FUSED_TOPK_UNION", "0") == "1"
+    )
+
+    # All seqlen is less than topk, use full attention
+    # Step 1: Flash attention with topk index (using index head)
+    idx_o, topk_idx = flash_prefill_with_topk_index(
+        q=idx_q,
+        k_cache=idx_k_cache,
+        v_cache=idx_v_cache,
+        sink=idx_sink,
+        req_to_token=req_to_token,
+        slot_ids=slot_ids,
+        cu_seqlens=cu_seqlens,
+        seq_lens=seq_lens,
+        prefix_lens=prefix_lens,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        block_size_q=block_size_q,
+        block_size_k=block_size_k,
+        topk=topk,
+        init_blocks=init_blocks,
+        local_blocks=local_blocks,
+        sm_scale=idx_sm_scale,
+        score_type=score_type,
+        disable_index_value=disable_index_value,
+        cu_seqblocks_q=cu_seqblocks_q,
+        max_seqblock_q=max_seqblock_q,
+        all_seqblock_q=all_seqblock_q,
+        q_scale=idx_q_scale,
+        k_scale=idx_k_scale,
+        v_scale=idx_v_scale,
+        dcp_size=dcp_size,
+        dcp_rank=dcp_rank,
+        dcp_group=dcp_group,
+        # The fused union accepts score-ranked AITER ids and emits a sorted
+        # unique block-id row itself.  Keep sorting for every other consumer.
+        sort_topk_ids=not (use_exact_grouped_main and fused_topk_union),
+    )
+    # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
+    num_idx_heads = idx_q.shape[1]
+    num_kv_heads = k_cache.shape[1]
+    idx_group_size = num_idx_heads // num_kv_heads
+    if idx_group_size > 1:
+        topk_idx = topk_index_reduce(
+            topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
+        )
+    q_for_main = (
+        dcp_group.all_gather(q.contiguous(), dim=1).contiguous()
+        if dcp_size > 1
+        else q
+    )
+    main_block_size_q = block_size_q
+    main_cu_seqblocks_q = cu_seqblocks_q
+    main_max_seqblock_q = max_seqblock_q
+    per_query_topk_idx = None
+    query_group_mask = None
+    # Query-sharded prefill CP passes a local max_seqlen_q (16K / CP8 = 2K).
+    # Selection thresholds describe the user-visible logical request, so use
+    # the pre-sharding length supplied by the backend when it is available.
+    # Exact Q1 index selection and grouped main attention are independent.
+    # The indexer above still computes one score row and one exact Top-K set for
+    # every query.  Grouping only unions those already-final sets for the main
+    # attention kernel, whose per-query membership mask excludes every block
+    # not selected by that query.  Therefore this changes scheduling and KV
+    # reuse, not sparse-attention semantics.  Limit the optimization to the
+    # long cache-hit extend window by default: using it while constructing the
+    # 128K causal prefix changes a handful of BF16 reductions and then persists
+    # those differences in the KV cache.  A zero length bound disables that
+    # side of the range check.
+    if use_exact_grouped_main and topk_idx.shape[1] == q.shape[0]:
         (
             main_cu_seqblocks_q,
             main_max_seqblock_q,
@@ -467,6 +473,7 @@ def minimax_sparse_decode(
     dcp_size: int = 1,
     dcp_rank: int = 0,
     dcp_group=None,
+    verify_group_size: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     k_cache = _flatten_main_kv_cache(k_cache)
     v_cache = _flatten_main_kv_cache(v_cache)
@@ -517,6 +524,7 @@ def minimax_sparse_decode(
         dcp_size=dcp_size,
         dcp_rank=dcp_rank,
         dcp_group=dcp_group,
+        verify_group_size=verify_group_size,
     )
     num_idx_heads = idx_q.shape[1]
     num_kv_heads = k_cache.shape[1]

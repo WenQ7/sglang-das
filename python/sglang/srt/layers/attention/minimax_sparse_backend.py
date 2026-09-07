@@ -132,6 +132,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.max_context_len = int(runner.model_config.context_len)
         # Per-forward cache for the native decode block table (rebuilt each forward).
         self._native_decode_bt: dict = {}
+        # Reuse the packed and restored query-sharded CP payload buffers across
+        # sparse layers. The forward stream orders each layer before reuse.
+        self._query_sharded_cp_pack_buffers: dict[tuple, torch.Tensor] = {}
+        self._query_sharded_cp_restore_buffers: dict[tuple, tuple[torch.Tensor, ...]] = {}
         self.fp8_attn_gemm = m3_fp8_attn_gemm_enabled(runner.server_args)
         if self.fp8_attn_gemm:
             assert self.kv_pool.main_pool.dtype == torch.float8_e4m3fn, (
@@ -160,6 +164,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._extend_meta_key: Optional[int] = None
         self._decode_seq_lens_i32_cg: dict[int, torch.Tensor] = {}
         self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
+        self._target_verify_meta_cache: dict[tuple, SimpleNamespace] = {}
+        self._target_verify_meta_cache_enabled = True
 
         # Experimental query-sharded prefill CP.  Each rank computes only its
         # zigzag query slices, while Main K/V and Index K/V for the new chunk
@@ -392,6 +398,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.speculative_num_draft_tokens = getattr(
             _sa, "speculative_num_draft_tokens", None
         )
+        self._target_verify_meta_cache_enabled = not bool(
+            getattr(_sa, "enable_two_batch_overlap", False)
+        )
         _decode_cuda_graph = not check_cuda_graph_backend(
             Phase.DECODE, Backend.DISABLED
         )
@@ -415,7 +424,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self.use_dense_sparse_decode and self.kv_pool.main_pool.head_num == 1
         )
         self.dense_backend: Optional[AttentionBackend] = None
-
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
@@ -502,11 +510,82 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     # Delegation helpers
     # ------------------------------------------------------------------
 
+    def _get_target_verify_meta(
+        self, forward_batch: ForwardBatch, ndt: int
+    ) -> Optional[SimpleNamespace]:
+        """Reuse TARGET_VERIFY request/length tensors across sparse layers."""
+        if not self._target_verify_meta_cache_enabled:
+            return None
+        bs = int(forward_batch.seq_lens.shape[0])
+        ndt = int(ndt)
+        if bs <= 0 or ndt <= 0:
+            return None
+
+        device = forward_batch.seq_lens.device
+        key = (device.type, device.index, bs, ndt)
+        meta = self._target_verify_meta_cache.get(key)
+        if meta is None:
+            # Graph setup runs before the backend starts the actual CUDA graph
+            # capture.  If this helper is nevertheless reached from inside a
+            # capture, leave allocation to the legacy graph-safe fallback.
+            try:
+                if torch.cuda.is_current_stream_capturing():
+                    return None
+            except Exception:
+                pass
+            try:
+                offsets = torch.arange(
+                    1, ndt + 1, device=device, dtype=torch.long
+                )
+                prefix_lens = torch.empty(
+                    bs, device=device, dtype=torch.long
+                )
+                req_matrix = torch.empty(
+                    (bs, ndt), device=device, dtype=torch.long
+                )
+                seq_matrix = torch.empty_like(req_matrix)
+            except RuntimeError:
+                try:
+                    capturing = torch.cuda.is_current_stream_capturing()
+                except Exception:
+                    capturing = False
+                if capturing:
+                    return None
+                raise
+            meta = SimpleNamespace(
+                offsets=offsets,
+                prefix_lens=prefix_lens,
+                req_matrix=req_matrix,
+                seq_matrix=seq_matrix,
+                per_query_req=req_matrix.reshape(-1),
+                per_query_seq_lens=seq_matrix.reshape(-1),
+            )
+            self._target_verify_meta_cache[key] = meta
+
+        meta.prefix_lens.copy_(forward_batch.seq_lens)
+        meta.req_matrix.copy_(
+            forward_batch.req_pool_indices.reshape(bs, 1).expand(bs, ndt)
+        )
+        torch.add(
+            meta.prefix_lens[:, None],
+            meta.offsets[None, :],
+            out=meta.seq_matrix,
+        )
+        return meta
+
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
         # getattr covers replay views lacking extend_seq_lens_cpu and TARGET_VERIFY.
         self._msa_dec_meta = None
+        if (
+            not self.is_npu
+            and forward_batch.forward_mode.is_target_verify()
+            and self.speculative_num_draft_tokens
+        ):
+            self._get_target_verify_meta(
+                forward_batch, int(self.speculative_num_draft_tokens)
+            )
         if self.is_npu:
             # Invalidate cached prefill/extend metadata; rebuilt on first sparse layer.
             self._prefill_meta = None
@@ -515,11 +594,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is not None:
             self._max_seqlen_q = int(max(extend_lens))
+        elif forward_batch.forward_mode.is_target_verify():
+            # EAGLE TARGET_VERIFY does not populate extend_seq_lens_cpu.  The
+            # packed query still contains one fixed-size verify block per
+            # request, so using the decode default (1) leaves all but the first
+            # verify row uncomputed.  This is especially damaging under graph
+            # replay: stale/zero logits make every draft miss and can corrupt
+            # the fallback target token.
+            self._max_seqlen_q = int(self.speculative_num_draft_tokens or 1)
         else:
             self._max_seqlen_q = 1
         if in_capture and (
             forward_batch.forward_mode.is_decode_or_idle()
-            or (self.is_npu and forward_batch.forward_mode.is_target_verify())
+            or forward_batch.forward_mode.is_target_verify()
         ):
             # Capture uses tiny dummy seq_lens; bound by full context so replay
             # (longer sequences) does not miss KV blocks.
@@ -1266,6 +1353,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # Layer-invariant metadata: built once per forward (first layer builds).
         meta = self._prefill_meta
         if meta is None:
+            # Graph setup runs before the backend starts the actual CUDA graph
+            # capture.  If this helper is nevertheless reached from inside a
+            # capture, leave allocation to the legacy graph-safe fallback.
+            try:
+                if torch.cuda.is_current_stream_capturing():
+                    return None
+            except Exception:
+                pass
             meta = self._build_prefill_meta(
                 forward_batch,
                 cu_seqlens,
@@ -1453,9 +1548,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
     def _resolve_extend_meta(self, forward_batch: ForwardBatch, q: torch.Tensor):
         """Return (cu_seqlens, seq_lens, prefix_lens); NPU caches per-forward casts."""
-        # NPU TARGET_VERIFY has extend_seq_lens=None (seq_lens=prefix+draft);
-        # reconstruct per-seq extend lengths + prefix_lens for cu_seqlens.
-        if self.is_npu and forward_batch.extend_seq_lens is None:
+        # TARGET_VERIFY may omit extend_seq_lens (seq_lens=prefix+draft) on
+        # both NPU and GPU speculative paths. Reconstruct the per-sequence
+        # draft lengths and prefix lengths needed by sparse prefill attention.
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and forward_batch.extend_seq_lens is None
+        ):
             _bs = forward_batch.seq_lens.shape[0]
             _ndt = self.speculative_num_draft_tokens or (q.shape[0] // max(_bs, 1))
             forward_batch.extend_seq_lens = torch.full(
@@ -1526,24 +1625,113 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
 
         shapes = [tuple(part.shape[1:]) for part in parts]
-        # Derive the row widths from shape rather than indexing row zero.  CP
-        # normally rejects empty local shards, but keeping this zero-token safe
-        # makes the packing helper robust to future padding/layout changes.
-        widths = [part.flatten(1).shape[1] for part in parts]
-        packed = torch.cat([part.flatten(1) for part in parts], dim=1).contiguous()
-        packed_full = strategy.gather_kv_cache(
-            packed, forward_batch, torch.cuda.current_stream()
+        # Derive row widths from shape rather than indexing row zero. Reuse the
+        # packed workspace and fill it in place to remove one allocation per
+        # sparse layer while preserving the single all-gather.
+        local_rows = int(k.shape[0])
+        if any(int(part.shape[0]) != local_rows for part in parts):
+            raise RuntimeError(
+                "MiniMax query-sharded CP payloads must have matching row counts"
+            )
+        flat_parts = [part.flatten(1) for part in parts]
+        widths = [flat.shape[1] for flat in flat_parts]
+        total_width = sum(widths)
+        pack_key = (k.device.index, k.dtype, tuple(widths))
+        packed = self._query_sharded_cp_pack_buffers.get(pack_key)
+        if packed is None or packed.shape[0] < local_rows:
+            capacity = max(local_rows, 2 * packed.shape[0] if packed is not None else 0)
+            packed = torch.empty(
+                (capacity, total_width), dtype=k.dtype, device=k.device
+            )
+            self._query_sharded_cp_pack_buffers[pack_key] = packed
+        # Use one output-backed cat launch instead of one copy launch per
+        # projection. The destination is a persistent workspace, so this does
+        # not add an allocation to the layer hot path.
+        torch.cat(flat_parts, dim=1, out=packed[:local_rows])
+        # This result is consumed immediately by the current-stream KV stores,
+        # so MiniMax can opt into the explicitly ephemeral reusable workspace.
+        packed_full = strategy.gather_kv_cache_reusable(
+            packed[:local_rows], forward_batch, torch.cuda.current_stream()
         )
-        full_parts = packed_full.split(widths, dim=1)
-        restored = [
-            part.reshape(packed_full.shape[0], *shape).contiguous()
-            for part, shape in zip(full_parts, shapes)
-        ]
+        return self._restore_query_sharded_cp_kv(
+            packed_full, shapes, widths, idx_v is not None
+        )
+
+    def _restore_query_sharded_cp_kv(
+        self,
+        packed_full: torch.Tensor,
+        shapes: list[tuple],
+        widths: list[int],
+        has_idx_v: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        full_rows = int(packed_full.shape[0])
+
+        # In the normal BF16 KV-cache path, packed_full has a contiguous inner
+        # dimension and an arbitrary row stride. The store kernels already
+        # carry row strides, so expose each payload as a view and avoid four
+        # full-size device-to-device restore copies. Quantized pools retain
+        # the old contiguous restore path because their quantizers may mutate
+        # or reinterpret the source tensor.
+        index_pool = (
+            self.kv_pool.index_kv_pool if has_idx_v else self.kv_pool.index_k_pool
+        )
+        # ``MHATokenToKOnlyPool`` is an unquantized raw-storage pool and does
+        # not expose the quant-method based property used by the regular MHA
+        # pool.  Fall back to its storage dtype contract instead of assuming
+        # every index-pool implementation has ``is_quantized_kv_cache``.
+        index_pool_is_quantized = index_pool is None or (
+            getattr(index_pool, "is_quantized_kv_cache")
+            if hasattr(index_pool, "is_quantized_kv_cache")
+            else index_pool.store_dtype != index_pool.dtype
+        )
+        zero_copy_restore = (
+            index_pool is not None
+            and not self.kv_pool.main_pool.is_quantized_kv_cache
+            and not index_pool_is_quantized
+        )
+        if zero_copy_restore:
+            views = []
+            offset = 0
+            for width, shape in zip(widths, shapes):
+                views.append(
+                    packed_full[:, offset : offset + width].view(
+                        full_rows, *shape
+                    )
+                )
+                offset += width
+            return (
+                views[0],
+                views[1],
+                views[2],
+                views[3] if has_idx_v else None,
+            )
+
+        restore_key = (k.device.index, k.dtype, tuple(shapes))
+        restore_buffers = self._query_sharded_cp_restore_buffers.get(restore_key)
+        if restore_buffers is None or restore_buffers[0].shape[0] < full_rows:
+            old_capacity = (
+                int(restore_buffers[0].shape[0])
+                if restore_buffers is not None
+                else 0
+            )
+            capacity = max(full_rows, 2 * old_capacity)
+            restore_buffers = tuple(
+                torch.empty(
+                    (capacity, *shape), dtype=k.dtype, device=k.device
+                )
+                for shape in shapes
+            )
+            self._query_sharded_cp_restore_buffers[restore_key] = restore_buffers
+        restored = tuple(buf[:full_rows] for buf in restore_buffers)
+        offset = 0
+        for dst, width, shape in zip(restored, widths, shapes):
+            dst.copy_(packed_full[:, offset : offset + width].reshape(full_rows, *shape))
+            offset += width
         return (
             restored[0],
             restored[1],
             restored[2],
-            None if idx_v is None else restored[3],
+            restored[3] if has_idx_v else None,
         )
 
     def forward_extend(
@@ -1589,7 +1777,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             forward_batch, layer.layer_id
         )
         # A fused QKNorm/RoPE projection can only have stored this CP rank's
-        # local token rows.  Query-sharded MiniMax CP needs every rank to own
+        # local token rows. Query-sharded MiniMax CP needs every rank to own
         # the complete new-chunk sparse KV, so overwrite that partial write
         # with the globally materialized tensors.
         store_loc, dcp_kv_mask = self._cache_store_loc_and_mask(forward_batch)
@@ -1614,8 +1802,125 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             idx_k_cache, idx_v_cache = self.kv_pool.get_index_kv_buffer(layer.layer_id)
 
-        cu_seqlens, seq_lens, prefix_lens = self._resolve_extend_meta(forward_batch, q)
+        if not self.is_npu and forward_batch.forward_mode.is_target_verify():
+            # EAGLE top-k=1 verification is a packed batch of short causal
+            # chains.  Running it through the long-prefill path is both
+            # wasteful and unsafe under ROCm graph capture (AITER Top-K is not
+            # captureable, while the generic Triton prefill Top-K uses static
+            # long-sequence workspaces).  Treat every verify position as a
+            # decode query with its own causal sequence length and reuse the
+            # graph-safe MiniMax decode score/main-attention kernels.
+            bs = int(forward_batch.seq_lens.shape[0])
+            spec_info = forward_batch.spec_info
+            ndt = int(
+                getattr(spec_info, "num_tokens_per_req", 0)
+                or self.speculative_num_draft_tokens
+                or 0
+            )
+            original_num_tokens = q.shape[0]
+            logical_num_tokens = bs * ndt
+            if bs <= 0 or ndt <= 0 or logical_num_tokens > original_num_tokens:
+                raise RuntimeError(
+                    "MiniMax TARGET_VERIFY expects a uniform packed query "
+                    "layout before DP residual padding, got "
+                    f"q_rows={original_num_tokens}, batch={bs}, width={ndt}."
+                )
+            if self.speculative_num_draft_tokens is not None and ndt != int(
+                self.speculative_num_draft_tokens
+            ):
+                raise RuntimeError(
+                    "MiniMax TARGET_VERIFY query width does not match "
+                    "--speculative-num-draft-tokens: "
+                    f"packed={ndt}, configured={self.speculative_num_draft_tokens}."
+                )
 
+            # DP MLP synchronization aligns token rows to the attention TP
+            # width.  The aligned count need not be divisible by the packed
+            # verification width (for example 16 rows for 5 * 3 logical
+            # rows), so the final rows are padding rather than another query
+            # position.  Sparse verify metadata intentionally describes only
+            # complete request groups; trim that residual here and restore it
+            # after attention for the rank-coupled MLP collectives.
+            if logical_num_tokens < original_num_tokens:
+                q = q[:logical_num_tokens]
+                idx_q = idx_q[:logical_num_tokens]
+
+            meta = self._get_target_verify_meta(forward_batch, ndt)
+            if meta is None:
+                per_query_req = forward_batch.req_pool_indices.long().repeat_interleave(
+                    ndt
+                )
+                # Spec-v2 keeps batch.seq_lens at the length *before* this
+                # verify iteration; draft cache rows begin at exactly that
+                # offset. Therefore causal lengths are prefix+1 .. prefix+ndt.
+                prefix_lens = forward_batch.seq_lens.to(torch.long)
+                offsets = torch.arange(
+                    1,
+                    ndt + 1,
+                    device=forward_batch.seq_lens.device,
+                    dtype=torch.long,
+                )
+                per_query_seq_lens = (
+                    prefix_lens[:, None] + offsets[None, :]
+                ).reshape(-1)
+            else:
+                per_query_req = meta.per_query_req
+                per_query_seq_lens = meta.per_query_seq_lens
+
+            if self.fp8_attn_gemm:
+                q = _quant_q_fp8(q, layer.q_scale_float)
+                idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
+
+            from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
+                minimax_sparse_decode,
+            )
+
+            idx_o, o = minimax_sparse_decode(
+                q,
+                None,
+                k_cache,
+                v_cache,
+                idx_q,
+                None,
+                idx_k_cache,
+                idx_v_cache,
+                self.req_to_token,
+                per_query_req,
+                per_query_seq_lens,
+                self._max_seqlen_k,
+                1,
+                self.block_size_k,
+                self.topk_blocks,
+                self.init_blocks,
+                self.local_blocks,
+                score_type=self.score_type,
+                disable_index_value=disable_value,
+                page_size=self.page_size,
+                use_msa=False,
+                q_scale=layer.q_scale_float,
+                k_scale=layer.k_scale_float,
+                v_scale=layer.v_scale_float,
+                idx_q_scale=layer.idx_q_scale_float,
+                idx_k_scale=layer.idx_k_scale_float,
+                idx_v_scale=layer.idx_v_scale_float,
+                dcp_size=self.dcp_size,
+                dcp_rank=self.dcp_rank,
+                dcp_group=self.dcp_group,
+                verify_group_size=ndt,
+            )
+            o = o.reshape(logical_num_tokens, -1).contiguous()
+            if idx_o is not None:
+                idx_o = idx_o.reshape(logical_num_tokens, -1).contiguous()
+            if logical_num_tokens < original_num_tokens:
+                pad_len = original_num_tokens - logical_num_tokens
+                o = torch.cat([o, o.new_zeros(pad_len, o.shape[1])], dim=0)
+                if idx_o is not None:
+                    idx_o = torch.cat(
+                        [idx_o, idx_o.new_zeros(pad_len, idx_o.shape[1])], dim=0
+                    )
+            return idx_o, o
+
+        cu_seqlens, seq_lens, prefix_lens = self._resolve_extend_meta(forward_batch, q)
         # DP attention pads q beyond real tokens; trim (CPU list avoids a sync).
         if cp_active:
             cp_meta = forward_batch.attn_cp_metadata
@@ -1663,8 +1968,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     prefix_lens,
                 )
         else:
-            # fp8 attention GEMMs: quantize q/idx_q AFTER the KV store (which reads
-            # the bf16 k/v) and the DP trim.
+            # fp8 attention GEMMs: quantize q/idx_q after the KV store (which
+            # reads the bf16 k/v) and the DP trim.
             if self.fp8_attn_gemm:
                 q = _quant_q_fp8(q, layer.q_scale_float)
                 idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
@@ -1682,7 +1987,6 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             logical_max_seqlen_q = max(
                 forward_batch.extend_seq_lens_cpu or [self._max_seqlen_q]
             )
-
             def run_sparse_segment(
                 segment_q,
                 segment_idx_q,
