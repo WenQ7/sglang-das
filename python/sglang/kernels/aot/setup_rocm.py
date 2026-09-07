@@ -45,6 +45,7 @@ sources = [
     "csrc/allreduce/deterministic_all_reduce.hip",
     "csrc/allreduce/quick_all_reduce.cu",
     "csrc/common_extension_rocm.cc",
+    "csrc/gemm/per_token_quant_fp8.cu",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/deepseek_v4_topk.cu",
     "csrc/elementwise/dsv4_norm_rope.cu",

@@ -149,6 +149,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
   m.impl("topk_sigmoid", torch::kCUDA, &topk_sigmoid);
 
   /*
+   * From csrc/gemm
+   */
+  m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s) -> ()");
+  m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
+
+  /*
    * From csrc/speculative
    */
   m.def(

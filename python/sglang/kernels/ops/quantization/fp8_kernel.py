@@ -69,6 +69,12 @@ if _is_musa:
 if _is_hip:
     try:
         from sgl_kernel import sgl_per_token_quant_fp8 as _hip_per_token_quant_fp8
+
+        # Some sgl_kernel wheels ship the Python wrapper without registering
+        # its backing torch operator.  Treat that combination as unavailable
+        # so sglang_per_token_quant_fp8 can use its existing Triton fallback.
+        if not hasattr(torch.ops.sgl_kernel, "sgl_per_token_quant_fp8"):
+            _hip_per_token_quant_fp8 = None
     except (ImportError, AttributeError):
         _hip_per_token_quant_fp8 = None
 
