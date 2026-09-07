@@ -320,10 +320,39 @@ class TestCPZigzagStrategy(CustomTestCase):
 
         with patch(
             "sglang.srt.environ.envs.SGLANG_ENABLE_CP_V2.get", return_value=True
+        ), patch(
+            "sglang.srt.environ.envs.SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE.get",
+            return_value=0,
         ):
             self.assertTrue(enable_cp_v2())
             self.assertTrue(is_cp_v2_active(active_batch))
             self.assertFalse(is_cp_v2_active(inactive_batch))
+
+    def test_cp_v2_min_tokens_is_enforced_per_sequence(self):
+        strategy = ZigzagCPStrategy(cp_size=4)
+        mode = _ExtendMode()
+        with patch(
+            "sglang.srt.environ.envs.SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE.get",
+            return_value=4096,
+        ):
+            self.assertFalse(
+                strategy.can_apply(
+                    8192,
+                    SimpleNamespace(
+                        forward_mode=mode,
+                        extend_seq_lens_cpu=[4095, 4097],
+                    ),
+                )
+            )
+            self.assertTrue(
+                strategy.can_apply(
+                    8192,
+                    SimpleNamespace(
+                        forward_mode=mode,
+                        extend_seq_lens_cpu=[4096, 4096],
+                    ),
+                )
+            )
 
     def _expected_metadata(self, *, rank, cp_size, seq_lens, extend_seq_lens):
         bs = len(extend_seq_lens)

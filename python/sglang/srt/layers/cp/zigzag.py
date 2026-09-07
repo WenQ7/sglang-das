@@ -118,7 +118,13 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         self._gather_index_cache: OrderedDict[tuple, torch.Tensor] = OrderedDict()
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
-        if self.cp_size <= 1 or num_tokens < self.cp_size * 2:
+        from sglang.srt.environ import envs
+
+        min_tokens = max(
+            self.cp_size * 2,
+            int(envs.SGLANG_PREFILL_CP_MIN_TOKENS_PER_SEQUENCE.get()),
+        )
+        if self.cp_size <= 1 or num_tokens < min_tokens:
             return False
         forward_mode = getattr(forward_batch, "forward_mode", None)
         if forward_mode is not None and not forward_mode.is_context_parallel_extend():
@@ -127,7 +133,10 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if extend_lens is None:
             return True
-        return all(int(length) >= self.cp_size * 2 for length in extend_lens)
+        # Do not let a large co-batched request pull short requests into CP.
+        # Requiring the threshold per sequence keeps all ranks on the same path
+        # and preserves the unsharded execution used for short-request accuracy.
+        return all(int(length) >= min_tokens for length in extend_lens)
 
     def build_metadata(
         self,
