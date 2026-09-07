@@ -4,7 +4,8 @@ Following the pattern of ``python/sglang/kernels/ops/attention/verify_splitkv.py
 
 Grid is ``(bs, n_head_blocks, split)``; each program handles ``BLOCK_H`` query
 heads x ALL ``L_EXT`` draft queries. It supports absorbed MLA and ordinary
-MHA/GQA when exactly one TP-local KV head is shared by all local query heads.
+MHA/GQA. Query-head blocks never cross a GQA group, so each block loads the
+corresponding KV head once and reuses it across ``BLOCK_H`` query heads.
 
 Correctness matches ``extend_attention_fwd`` for the topk==1 causal verify case.
 
@@ -69,7 +70,9 @@ def _verify_mla_prefix_stage1(
     stride_qbs,
     stride_qh,
     stride_buf_kbs,
+    stride_buf_kh,
     stride_buf_vbs,
+    stride_buf_vh,
     stride_ob,
     stride_oh,
     stride_os,
@@ -78,6 +81,7 @@ def _verify_mla_prefix_stage1(
     stride_lh,
     stride_ls,
     H_Q: tl.constexpr,
+    KV_GROUP_NUM: tl.constexpr,
     L_EXT: tl.constexpr,
     BLOCK_H: tl.constexpr,
     NOPE_DIM: tl.constexpr,
@@ -102,6 +106,7 @@ def _verify_mla_prefix_stage1(
     # skip idle workgroups
     if split_kv_id < active:
         head_start = head_block * BLOCK_H
+        cur_kv_head = head_start // KV_GROUP_NUM
         offs_h = head_start + tl.arange(0, BLOCK_H)
         offs_l = tl.arange(0, L_EXT)
         offs_dn = tl.arange(0, BLOCK_DNOPE)
@@ -149,7 +154,10 @@ def _verify_mla_prefix_stage1(
             kv_loc = tl.load(
                 kv_indices + cur_batch_kv_start_idx + offs_n, mask=n_mask, other=0
             )
-            base = kv_loc[None, :] * stride_buf_kbs
+            base = (
+                kv_loc[None, :] * stride_buf_kbs
+                + cur_kv_head * stride_buf_kh
+            )
             k_nope = tl.load(
                 K_Buffer + base + offs_dn[:, None],
                 mask=(offs_dn[:, None] < NOPE_DIM) & n_mask[None, :],
@@ -169,7 +177,10 @@ def _verify_mla_prefix_stage1(
             # MLA exposes its latent V through V_Buffer; ordinary shared-KV
             # attention has an independent V cache. Both use this same load.
             v = tl.load(
-                V_Buffer + kv_loc[:, None] * stride_buf_vbs + offs_dv[None, :],
+                V_Buffer
+                + kv_loc[:, None] * stride_buf_vbs
+                + cur_kv_head * stride_buf_vh
+                + offs_dv[None, :],
                 mask=n_mask[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
                 other=0.0,
             )
@@ -227,7 +238,9 @@ def _verify_mla_combine_stage2(
     stride_qbs,
     stride_qh,
     stride_kebs,
+    stride_keh,
     stride_vebs,
+    stride_veh,
     stride_oobs,
     stride_ooh,
     L_EXT: tl.constexpr,
@@ -236,9 +249,11 @@ def _verify_mla_combine_stage2(
     BLOCK_DMODEL: tl.constexpr,
     BLOCK_DV: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    KV_GROUP_NUM: tl.constexpr,
 ):
     cur_batch = tl.program_id(0)
     cur_head = tl.program_id(1)
+    cur_kv_head = cur_head // KV_GROUP_NUM
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
@@ -294,13 +309,21 @@ def _verify_mla_combine_stage2(
     q = tl.load(
         Q + offs_q, mask=mask_l[:, None] & (offs_d[None, :] < HEAD_DIM), other=0.0
     ).to(tl.float32)
-    offs_ke = (cur_q_start + offs_l)[:, None] * stride_kebs + offs_d[None, :]
+    offs_ke = (
+        (cur_q_start + offs_l)[:, None] * stride_kebs
+        + cur_kv_head * stride_keh
+        + offs_d[None, :]
+    )
     ke = tl.load(
         K_Extend + offs_ke,
         mask=mask_l[:, None] & (offs_d[None, :] < HEAD_DIM),
         other=0.0,
     ).to(tl.float32)
-    offs_ve = (cur_q_start + offs_l)[:, None] * stride_vebs + offs_dv[None, :]
+    offs_ve = (
+        (cur_q_start + offs_l)[:, None] * stride_vebs
+        + cur_kv_head * stride_veh
+        + offs_dv[None, :]
+    )
     ve = tl.load(
         V_Extend + offs_ve,
         mask=mask_l[:, None] & (offs_dv[None, :] < V_HEAD_DIM),
@@ -341,6 +364,7 @@ class VerifyMLA:
         self,
         max_bs,
         h_q,
+        h_kv,
         head_dim,
         v_head_dim,
         l_ext,
@@ -350,6 +374,8 @@ class VerifyMLA:
         num_warps=DEFAULT_NUM_WARPS,
     ):
         self.h_q = h_q
+        self.h_kv = h_kv
+        self.kv_group_num = h_q // h_kv
         self.head_dim = head_dim
         self.v_head_dim = v_head_dim
         self.nope_dim = v_head_dim
@@ -418,7 +444,9 @@ class VerifyMLA:
             q_extend.stride(0),
             q_extend.stride(1),
             k_buffer.stride(0),
+            k_buffer.stride(1),
             v_buffer.stride(0),
+            v_buffer.stride(1),
             self.att_out.stride(0),
             self.att_out.stride(1),
             self.att_out.stride(2),
@@ -427,6 +455,7 @@ class VerifyMLA:
             self.att_lse.stride(1),
             self.att_lse.stride(2),
             H_Q=self.h_q,
+            KV_GROUP_NUM=self.kv_group_num,
             L_EXT=self.l_pad,
             BLOCK_H=self.block_h,
             NOPE_DIM=self.nope_dim,
@@ -475,7 +504,9 @@ class VerifyMLA:
             q_extend.stride(0),
             q_extend.stride(1),
             k_extend.stride(0),
+            k_extend.stride(1),
             v_extend.stride(0),
+            v_extend.stride(1),
             o_out.stride(0),
             o_out.stride(1),
             L_EXT=self.l_pad,
@@ -484,6 +515,7 @@ class VerifyMLA:
             BLOCK_DMODEL=triton.next_power_of_2(self.head_dim),
             BLOCK_DV=triton.next_power_of_2(self.v_head_dim),
             BLOCK_N=self.block_n,
+            KV_GROUP_NUM=self.kv_group_num,
             num_warps=4,
             num_stages=1,
         )
@@ -542,14 +574,15 @@ class VerifyMLA:
 _VMLA_CACHE = {}
 
 
-def _get_vmla(max_bs, h_q, head_dim, v_head_dim, l_ext, device):
-    key = (h_q, head_dim, v_head_dim, l_ext, str(device))
+def _get_vmla(max_bs, h_q, h_kv, head_dim, v_head_dim, l_ext, device):
+    key = (h_q, h_kv, head_dim, v_head_dim, l_ext, str(device))
     vk = _VMLA_CACHE.get(key)
     if vk is None:
         block_h, block_n, num_warps = block_config(head_dim)
         vk = VerifyMLA(
             max_bs,
             h_q,
+            h_kv,
             head_dim,
             v_head_dim,
             l_ext,
@@ -676,7 +709,8 @@ def verify_shared_kv_fwd(
     """
     Grouped-head drop-in for extend_attention_fwd on a topk==1 target-verify
     shape. Returns True if it ran (o_extend written), False if unsupported
-    (caller falls back). Requires exactly one TP-local KV head.
+    (caller falls back). Supports ordinary GQA when ``BLOCK_H`` divides the
+    local GQA group.
     """
     if not can_handle(
         q_extend,
@@ -697,8 +731,6 @@ def verify_shared_kv_fwd(
         xai_temperature_len=xai_temperature_len,
     ):
         return False
-    if k_extend.shape[1] != 1:
-        return False
     if q_extend.shape[2] < v_extend.shape[2]:
         return False
     if kv_indices.numel() == 0:
@@ -706,9 +738,14 @@ def verify_shared_kv_fwd(
 
     bs = qo_indptr.shape[0] - 1
     h_q = q_extend.shape[1]
+    h_kv = k_extend.shape[1]
     head_dim = q_extend.shape[2]
     v_head_dim = v_extend.shape[2]
     l_ext = int(max_len_extend)
+    block_h, _, _ = block_config(head_dim)
+    kv_group_num = h_q // h_kv
+    if block_h > kv_group_num or kv_group_num % block_h != 0:
+        return False
 
     if sm_scale is None:
         sm_scale = 1.0 / (head_dim**0.5)
@@ -723,7 +760,9 @@ def verify_shared_kv_fwd(
 
     if max_bs is None or max_bs < bs:
         max_bs = bs
-    vk = _get_vmla(max_bs, h_q, head_dim, v_head_dim, l_ext, q_extend.device)
+    vk = _get_vmla(
+        max_bs, h_q, h_kv, head_dim, v_head_dim, l_ext, q_extend.device
+    )
     vk(
         q_extend,
         k_extend.contiguous(),

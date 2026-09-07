@@ -63,7 +63,11 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             self.self_attn.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("qkv_proj", prefix),
+            # Keep the canonical checkpoint/module path. Quantization configs
+            # match ignore/target rules against this prefix; dropping
+            # ``self_attn`` makes an attention-ignore rule miss and can
+            # silently construct FP8 QKV parameters without checkpoint scales.
+            prefix=add_prefix("self_attn.qkv_proj", prefix),
         )
 
         if config.model_type == "llama4_text":
@@ -72,10 +76,18 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             inter_size = config.intermediate_size
 
         self.mlp = LlamaMLP(
-            config.hidden_size, inter_size, config.hidden_act, quant_config, prefix
+            config.hidden_size,
+            inter_size,
+            config.hidden_act,
+            quant_config,
+            add_prefix("mlp", prefix),
         )
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # TorchSpec's Llama EAGLE3 layer keeps the pre-normalization target
+        # hidden state as the first residual.  Preserve that training semantic
+        # by default; checkpoints with a different convention can opt in.
+        self.norm_before_residual = getattr(config, "norm_before_residual", False)
 
     def forward(
         self,
@@ -88,8 +100,12 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
 
         if self.is_input_layer:
             # Input layer consumes target hidden states; no carried residual to fuse.
-            residual = hidden_states
-            hidden_states = self.hidden_norm(hidden_states)
+            if self.norm_before_residual:
+                hidden_states = self.hidden_norm(hidden_states)
+                residual = hidden_states
+            else:
+                residual = hidden_states
+                hidden_states = self.hidden_norm(hidden_states)
             embeds = self.input_layernorm(embeds)
             hidden_states = torch.cat([embeds, hidden_states], dim=-1)
         else:
@@ -189,7 +205,12 @@ class LlamaModel(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                LlamaDecoderLayer(config, i, quant_config, prefix)
+                LlamaDecoderLayer(
+                    config,
+                    i,
+                    quant_config,
+                    add_prefix(f"layers.{i}", prefix),
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )

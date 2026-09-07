@@ -479,6 +479,22 @@ class MiniMaxM3MoE(nn.Module):
         else:
             self.shared_experts = None
 
+        self.enable_standard_ep_shared_expert_overlap = (
+            _is_hip
+            and envs.SGLANG_OPT_USE_MINIMAX_STANDARD_EP_SHARED_EXPERT_OVERLAP.get()
+            and parallel.moe_ep_size > 1
+            and get_moe_a2a_backend().is_none()
+            and self.shared_experts is not None
+            and self.num_fused_shared_experts == 0
+            and self.alt_stream is not None
+        )
+        if self.enable_standard_ep_shared_expert_overlap and layer_id == 0:
+            log_info_on_rank0(
+                logger,
+                "MiniMax standard-EP TP-sharded shared-expert overlap enabled "
+                f"(HIP, EP={parallel.moe_ep_size}, full decode graph capture).",
+            )
+
         self.bf16_router_gemm = envs.SGLANG_OPT_USE_BF16_ROUTER_GEMM.get()
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -522,6 +538,20 @@ class MiniMaxM3MoE(nn.Module):
     ) -> torch.Tensor:
         if hidden_states.shape[0] > 0:
             if (
+                self.enable_standard_ep_shared_expert_overlap
+                and get_is_capture_mode()
+            ):
+                # Keep AITER routed MoE on the main stream.  The TP8-sharded
+                # shared branch is shorter and can occupy otherwise idle CUs
+                # on a side stream; both join before the existing add + TP8
+                # reduction, so no collective ordering changes.
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output = self._forward_shared_experts(hidden_states)
+                final_hidden_states = self._forward_router_experts(hidden_states)
+                current_stream.wait_stream(self.alt_stream)
+            elif (
                 self.alt_stream is not None
                 and self.shared_experts is not None
                 and get_is_capture_mode()
@@ -1743,7 +1773,17 @@ class MiniMaxM3Model(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        alt_stream = get_stream("alt") if _is_cuda else None
+        if _is_cuda:
+            alt_stream = get_stream("alt")
+        elif (
+            _is_hip
+            and envs.SGLANG_OPT_USE_MINIMAX_STANDARD_EP_SHARED_EXPERT_OVERLAP.get()
+        ):
+            # A dedicated name avoids coupling the MoE graph dependencies to
+            # unrelated cache/attention users of the legacy "alt" stream.
+            alt_stream = get_stream("minimax_m3_standard_ep_shared")
+        else:
+            alt_stream = None
 
         def layer_fn(idx, prefix: str) -> nn.Module:
             return MiniMaxM3DecoderLayer(
@@ -1799,10 +1839,19 @@ class MiniMaxM3Model(nn.Module):
         # (MAX_LEN) DP layout.  EXTEND/SUM_LEN child metadata needs a separate
         # variable-length implementation and deliberately stays on the normal
         # forward path.
-        run_decode_tbo = forward_batch.can_run_tbo and (
-            forward_batch.global_forward_mode
-            in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY)
-        ) and forward_batch.batch_size >= 2
+        # EAGLE3 consumes snapshots from three target layers.  The TBO operation
+        # graph currently bypasses the per-layer capture hook below, so using it
+        # would return no auxiliary hidden states to the draft model.  Keep the
+        # ordinary layer loop whenever capture is active.
+        run_decode_tbo = (
+            not self.layers_to_capture
+            and forward_batch.can_run_tbo
+            and (
+                forward_batch.global_forward_mode
+                in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY)
+            )
+            and forward_batch.batch_size >= 2
+        )
         run_decode_tbo = run_decode_tbo and (
             forward_batch.tbo_children is not None
             and all(
@@ -1918,16 +1967,22 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 "in ModelOpt mixed-precision checkpoints."
             )
         # Keep the conservative platform checks below as the automatic policy,
-        # but honor the existing explicit override for validated deployments.
-        # In particular, the BW1100 channel-FP8 path uses the standard
-        # dispatcher plus AITER unified MoE and can represent the always-on
-        # shared expert as the 129th FP8 expert slot.  The override is required
-        # until that ROCm path has broad device coverage.
+        # but honor the existing explicit override for validated EP1
+        # deployments.  Under standard EP8 the routed experts are MoE-TP1,
+        # whereas the shared MLP must stay TP8-sharded. A single grouped-MoE
+        # expert shape cannot represent both layouts; replicating a full shared
+        # expert on every rank would multiply its contribution in the TP8 sum.
         if get_exec().moe.enforce_shared_experts_fusion:
             if hf_config.n_shared_experts != 1:
                 raise ValueError(
                     "MiniMax-M3 shared-experts fusion expects exactly one shared "
                     f"expert, but got n_shared_experts={hf_config.n_shared_experts}."
+                )
+            if get_parallel().moe_ep_size > 1:
+                return (
+                    "MiniMax-M3 fused shared expert is invalid with expert "
+                    "parallelism: keep it TP-sharded and use the standard-EP "
+                    "shared-expert overlap path instead."
                 )
             return None
         if not _is_cuda:
@@ -1960,12 +2015,19 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         self.capture_aux_hidden_states = True
         if layer_ids is None:
             num_layers = self.config.num_hidden_layers
+            # Match vLLM's default EAGLE3 convention.  vLLM records the output
+            # of ``layer - 1`` for default auxiliary ids (2, 30, 57), while
+            # MiniMaxM3Model records the same tensor at the next layer entry.
+            # Therefore these default entry indices are already correct and
+            # must not receive another +1 offset.
             self.model.layers_to_capture = [
                 2,
                 num_layers // 2,
                 num_layers - 3,
             ]
         else:
+            # Explicit checkpoint ids denote zero-based target layer outputs.
+            # Capture those outputs at the following layer entry.
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
         # forward checks the per-layer ``_is_layer_to_capture`` flag, not the id

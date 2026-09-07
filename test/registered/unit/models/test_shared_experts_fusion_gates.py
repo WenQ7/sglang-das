@@ -240,6 +240,18 @@ class TestMiniMaxGates(_FusionGateCase):
             ),
         )
 
+    def test_enforce_does_not_make_standard_ep8_shared_fusion_valid(self):
+        from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
+
+        self._seed(enforce_shared_experts_fusion=True)
+        reason = self._reason(
+            MiniMaxM3SparseForCausalLM,
+            SimpleNamespace(n_shared_experts=1),
+            _quant("w8a8_fp8"),
+            moe_ep_size=8,
+        )
+        self.assertIn("keep it TP-sharded", reason)
+
     def test_enforce_rejects_multiple_shared_experts(self):
         from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
 
@@ -261,6 +273,21 @@ class TestMiniMaxGates(_FusionGateCase):
         self.assertIn(
             "No shared experts",
             self._reason(MiniMaxM3SparseForConditionalGeneration, wrapper),
+        )
+
+    def test_enforce_reaches_the_vl_text_model_on_a_validated_rocm_backend(self):
+        from sglang.srt.models.minimax_m3_vl import (
+            MiniMaxM3SparseForConditionalGeneration,
+        )
+
+        self._seed(enforce_shared_experts_fusion=True)
+        wrapper = SimpleNamespace(text_config=SimpleNamespace(n_shared_experts=1))
+        self.assertIsNone(
+            self._reason(
+                MiniMaxM3SparseForConditionalGeneration,
+                wrapper,
+                _quant("w8a8_fp8"),
+            )
         )
 
 
