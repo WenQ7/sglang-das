@@ -48,6 +48,17 @@ def parse_json_object(value: str) -> dict:
     return parsed
 
 
+def _local_eval_subprocess_env(host: str | None) -> dict[str, str]:
+    """Return an environment that never proxies the local eval endpoint."""
+    eval_env = os.environ.copy()
+    no_proxy_hosts = ["127.0.0.1", "localhost", "0.0.0.0", str(host or "")]
+    for key in ("NO_PROXY", "no_proxy"):
+        entries = [item for item in eval_env.get(key, "").split(",") if item]
+        entries.extend(value for value in no_proxy_hosts if value and value not in entries)
+        eval_env[key] = ",".join(entries)
+    return eval_env
+
+
 def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
     chat_template_kwargs = getattr(args, "chat_template_kwargs", None)
     if isinstance(chat_template_kwargs, str):
@@ -218,6 +229,13 @@ def _run_sgl_eval(eval_name, args) -> dict:
     # protocols are not comparable even when they all say "GSM8K".
     print("sgl-eval command:", " ".join(cmd), flush=True)
 
+    # The eval server is normally local.  Python/httpx honors HTTP(S)_PROXY,
+    # but unlike curl it does not always bypass loopback implicitly.  Without
+    # this guard a machine-wide proxy can turn every local accuracy request
+    # into a retried 503 and the resulting empty generations look like a model
+    # accuracy regression.
+    eval_env = _local_eval_subprocess_env(getattr(args, "host", None))
+
     try:
         completed = subprocess.run(
             cmd,
@@ -225,6 +243,7 @@ def _run_sgl_eval(eval_name, args) -> dict:
             capture_output=True,
             check=False,
             timeout=getattr(args, "sgl_eval_timeout", None),
+            env=eval_env,
         )
     except subprocess.TimeoutExpired as e:
         raise TimeoutError(
