@@ -258,17 +258,11 @@ def _decode_score_kernel(
 
 @triton.heuristics(
     {
-        "BATCH_SIZE_BUCKET": lambda args: triton.next_power_of_2(
-            args["batch_size"]
+        "REQUEST_BATCH_SIZE_BUCKET": lambda args: triton.next_power_of_2(
+            args["request_batch_size"]
         ),
         "BLOCK_SIZE_H": lambda args: max(
             16, triton.next_power_of_2(args["gqa_group_size"])
-        ),
-        "BLOCK_SIZE_M": lambda args: max(
-            16,
-            triton.next_power_of_2(
-                args["batch_size"] * args["gqa_group_size"]
-            ),
         ),
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
     }
@@ -279,7 +273,7 @@ def _decode_score_kernel(
         triton.Config({"BLOCK_SIZE_N": 128}, num_warps=4, num_stages=1),
     ],
     key=[
-        "BATCH_SIZE_BUCKET",
+        "REQUEST_BATCH_SIZE_BUCKET",
         "gqa_group_size",
         "head_dim",
         "block_size",
