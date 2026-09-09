@@ -367,6 +367,95 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     self.block_size_k,
                 )
 
+        # Explicit MiniMax-only FlashMLA backend. Stage-3 is independently
+        # selectable; the indexer gate below additionally replaces Stage-1/2.
+        self.use_flash_mla_gfx938 = (
+            envs.SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938.get()
+        )
+        self.use_flash_mla_gfx938_decode = (
+            self.use_flash_mla_gfx938
+            and envs.SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938_DECODE.get()
+        )
+        self.use_flash_mla_gfx938_indexer = (
+            self.use_flash_mla_gfx938
+            and envs.SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938_INDEXER.get()
+        )
+        if self.use_flash_mla_gfx938:
+            if self.is_npu:
+                raise RuntimeError(
+                    "SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938 requires ROCm gfx938"
+                )
+            from sglang.srt.layers.attention.minimax_sparse_ops.flash_mla_gfx938 import (
+                flash_mla_gfx938_available,
+            )
+
+            local_q_heads = (
+                runner.model_config.num_attention_heads
+                // get_parallel().attn_tp_size
+            )
+            local_kv_heads = self.kv_pool.main_pool.head_num
+            contract_errors = []
+            if not flash_mla_gfx938_available():
+                contract_errors.append(
+                    "installed flash_mla lacks usable gfx938 MSA128 kernels"
+                )
+            if self.dcp_size != 1:
+                contract_errors.append(f"DCP must be 1, got {self.dcp_size}")
+            if self.fp8_attn_gemm:
+                contract_errors.append("FP8 attention GEMM must be disabled")
+            if self.kv_pool.main_pool.dtype != torch.bfloat16:
+                contract_errors.append(
+                    f"KV cache must be BF16, got {self.kv_pool.main_pool.dtype}"
+                )
+            if self.block_size_k != 128 or self.kv_pool.page_size != 128:
+                contract_errors.append(
+                    "sparse block size and KV page size must both be 128, got "
+                    f"block={self.block_size_k}, page={self.kv_pool.page_size}"
+                )
+            if self.topk_blocks != 16:
+                contract_errors.append(
+                    f"sparse TopK must be 16, got {self.topk_blocks}"
+                )
+            if (local_q_heads, local_kv_heads) != (64, 4):
+                contract_errors.append(
+                    "local heads must be Q64/KV4 (attention TP1), got "
+                    f"Q{local_q_heads}/KV{local_kv_heads}"
+                )
+            if self.use_flash_mla_gfx938_indexer:
+                if self.score_type != "max":
+                    contract_errors.append(
+                        f"FlashMLA Stage-1/2 requires score_type=max, got {self.score_type}"
+                    )
+                if set(self.sparse_layer_ids) != self.disable_value_layer_ids:
+                    contract_errors.append(
+                        "FlashMLA Stage-1/2 requires Index Value disabled on "
+                        "every sparse layer"
+                    )
+                if (
+                    get_parallel().attn_cp_size > 1
+                    and os.environ.get(
+                        "SGLANG_MINIMAX_COMBINE_CP_SEGMENTS", "0"
+                    )
+                    == "1"
+                ):
+                    contract_errors.append(
+                        "FlashMLA Stage-1/2 does not support combined CP segments; "
+                        "set SGLANG_MINIMAX_COMBINE_CP_SEGMENTS=0"
+                    )
+            if getattr(runner.server_args, "enable_two_batch_overlap", False):
+                contract_errors.append("two-batch overlap is not supported yet")
+            if contract_errors:
+                raise RuntimeError(
+                    "gfx938 FlashMLA MSA128 contract mismatch: "
+                    + "; ".join(contract_errors)
+                )
+            if self.use_msa:
+                logger.info(
+                    "[MiniMaxSparse] gfx938 FlashMLA explicitly replaces the "
+                    "fmha_sm100 MSA Stage-3 backend"
+                )
+            self.use_msa = False
+
         self._msa_dec_meta = None
         if self.use_msa:
             self.num_q_heads = (
@@ -378,10 +467,20 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             ) // self.block_size_k
             self._msa_cg: dict[int, tuple] = {}
 
+        self._flash_mla_page_table = None
+        self._flash_mla_page_tables: dict[tuple, torch.Tensor] = {}
+        self._flash_mla_sched_meta: dict[tuple[int, int], object] = {}
+        self._flash_mla_prefill_indices: dict[tuple, torch.Tensor] = {}
+        self._flash_mla_decode_indices: dict[tuple, torch.Tensor] = {}
+        self._flash_mla_nb_max = (
+            self.req_to_token.shape[1] + self.block_size_k - 1
+        ) // self.block_size_k
+
         self.page_size = self.kv_pool.page_size
         self.use_dense_sparse_decode = (
             (not self.is_npu)
             and self.dcp_size == 1
+            and not self.use_flash_mla_gfx938
             and envs.SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE.get()
             and self.block_size_k % self.page_size == 0
             # _dense_sparse_main_decode calls trtllm decode with a bf16 q and
@@ -404,6 +503,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         _decode_cuda_graph = not check_cuda_graph_backend(
             Phase.DECODE, Backend.DISABLED
         )
+        self._flash_mla_decode_current = False
         self._use_msa_decode = self.use_msa and (
             not _decode_cuda_graph or envs.SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH.get()
         )
@@ -424,11 +524,18 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self.use_dense_sparse_decode and self.kv_pool.main_pool.head_num == 1
         )
         self.dense_backend: Optional[AttentionBackend] = None
+        _main_attn_name = (
+            "flash_mla_gfx938"
+            if self.use_flash_mla_gfx938
+            else ("MSA" if self.use_msa else "triton")
+        )
         logger.info(
             f"[MiniMaxSparse] Backend initialized "
             f"(score_type={self.score_type!r}, "
-            f"main_attn={'MSA' if self.use_msa else 'triton'}, "
+            f"main_attn={_main_attn_name}, "
             f"msa_decode={self._use_msa_decode}, "
+            f"flash_mla_decode={self.use_flash_mla_gfx938_decode}, "
+            f"flash_mla_indexer={self.use_flash_mla_gfx938_indexer}, "
             f"msa_owns_decode={self._msa_owns_decode}, "
             f"decode_cuda_graph={_decode_cuda_graph}, "
             f"prefill_block_q={self.block_size_q}, "
@@ -578,6 +685,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
     ):
         # getattr covers replay views lacking extend_seq_lens_cpu and TARGET_VERIFY.
         self._msa_dec_meta = None
+        self._flash_mla_page_table = None
         if (
             not self.is_npu
             and forward_batch.forward_mode.is_target_verify()
@@ -613,6 +721,35 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._max_seqlen_k = self.max_context_len
         else:
             self._max_seqlen_k = int(forward_batch.seq_lens_cpu.max().item())
+
+        if self.use_flash_mla_gfx938:
+            is_decode_like = (
+                forward_batch.forward_mode.is_decode_or_idle()
+                or forward_batch.forward_mode.is_target_verify()
+            )
+            self._flash_mla_decode_current = (
+                self.use_flash_mla_gfx938_decode and is_decode_like
+            )
+            if (
+                forward_batch.forward_mode.is_target_verify()
+                and self._flash_mla_decode_current
+            ):
+                ndt = int(self.speculative_num_draft_tokens or 0)
+                verify_meta = self._get_target_verify_meta(forward_batch, ndt)
+                if verify_meta is None:
+                    raise RuntimeError(
+                        "gfx938 FlashMLA TARGET_VERIFY requires reusable packed "
+                        "request metadata"
+                    )
+                self._prepare_flash_mla_page_table(
+                    verify_meta.per_query_req,
+                    verify_meta.per_query_seq_lens,
+                )
+            else:
+                self._prepare_flash_mla_page_table(
+                    forward_batch.req_pool_indices,
+                    forward_batch.seq_lens,
+                )
 
         # Build plan + page table eager (outside capture) so captured forward_decode
         # runs only device-side ops; host-side code can't be captured.
@@ -699,6 +836,82 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self.num_kv_heads,
         )
         self._msa_dec_meta = (kv_indices_buf, plan)
+
+    def _prepare_flash_mla_page_table(
+        self, slot_ids: torch.Tensor, seq_lens: torch.Tensor
+    ) -> None:
+        """Refresh a stable logical-page to physical-page table for this batch."""
+        from sglang.srt.layers.attention.minimax_sparse_ops.flash_mla_gfx938 import (
+            update_flash_mla_page_table,
+        )
+
+        rows = int(slot_ids.numel())
+        if rows == 0:
+            return
+        device = slot_ids.device
+        key = (device.type, device.index, rows)
+        table = self._flash_mla_page_tables.get(key)
+        if table is None:
+            table = torch.empty(
+                (rows, self._flash_mla_nb_max),
+                dtype=torch.int32,
+                device=device,
+            )
+            self._flash_mla_page_tables[key] = table
+        update_flash_mla_page_table(
+            table,
+            self.req_to_token,
+            slot_ids,
+            seq_lens,
+            self.block_size_k,
+        )
+        self._flash_mla_page_table = table
+
+    def _get_flash_mla_sched_meta(self, layer_id: int, rows: int):
+        """Keep one initialized FlashMLA scheduler object per layer/graph shape."""
+        key = (int(layer_id), int(rows))
+        meta = self._flash_mla_sched_meta.get(key)
+        if meta is None:
+            from sglang.srt.layers.attention.minimax_sparse_ops.flash_mla_gfx938 import (
+                new_flash_mla_decode_metadata,
+            )
+
+            meta = new_flash_mla_decode_metadata()
+            self._flash_mla_sched_meta[key] = meta
+        return meta
+
+    def _get_flash_mla_indices_output(
+        self,
+        rows: int,
+        device: torch.device,
+        *,
+        decode: bool,
+    ) -> torch.Tensor:
+        """Reuse the page-expanded Top16 workspace across sparse layers."""
+        rows = int(rows)
+        if decode:
+            key = (device.type, device.index, rows)
+            output = self._flash_mla_decode_indices.get(key)
+            if output is None:
+                output = torch.empty(
+                    (rows, 1, 4, 16 * self.block_size_k),
+                    dtype=torch.int32,
+                    device=device,
+                )
+                self._flash_mla_decode_indices[key] = output
+            return output
+
+        stream_id = int(torch.cuda.current_stream(device).cuda_stream)
+        key = (device.type, device.index, stream_id)
+        output = self._flash_mla_prefill_indices.get(key)
+        if output is None or output.shape[0] < rows:
+            output = torch.empty(
+                (rows, 4, 16 * self.block_size_k),
+                dtype=torch.int32,
+                device=device,
+            )
+            self._flash_mla_prefill_indices[key] = output
+        return output[:rows]
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         if not self.is_npu:
@@ -1897,6 +2110,26 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 disable_index_value=disable_value,
                 page_size=self.page_size,
                 use_msa=False,
+                use_flash_mla_gfx938=self._flash_mla_decode_current,
+                use_flash_mla_gfx938_indexer=(
+                    self.use_flash_mla_gfx938_indexer
+                    and self._flash_mla_decode_current
+                ),
+                flash_mla_page_table=self._flash_mla_page_table,
+                flash_mla_sched_meta=(
+                    self._get_flash_mla_sched_meta(
+                        layer.layer_id, logical_num_tokens
+                    )
+                    if self._flash_mla_decode_current
+                    else None
+                ),
+                flash_mla_indices_output=(
+                    self._get_flash_mla_indices_output(
+                        logical_num_tokens, q.device, decode=True
+                    )
+                    if self._flash_mla_decode_current
+                    else None
+                ),
                 q_scale=layer.q_scale_float,
                 k_scale=layer.k_scale_float,
                 v_scale=layer.v_scale_float,
@@ -2026,6 +2259,20 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     score_type=self.score_type,
                     disable_index_value=disable_value,
                     use_msa=self.use_msa,
+                    use_flash_mla_gfx938=self.use_flash_mla_gfx938,
+                    use_flash_mla_gfx938_indexer=(
+                        self.use_flash_mla_gfx938_indexer
+                    ),
+                    flash_mla_page_table=self._flash_mla_page_table,
+                    flash_mla_indices_output=(
+                        self._get_flash_mla_indices_output(
+                            segment_q.shape[0],
+                            segment_q.device,
+                            decode=False,
+                        )
+                        if self.use_flash_mla_gfx938
+                        else None
+                    ),
                     seqlens_cpu=segment_q_lens_cpu,
                     q_scale=layer.q_scale_float,
                     k_scale=layer.k_scale_float,
@@ -2164,9 +2411,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                         for stream in streams:
                             current_stream.wait_stream(stream)
                     else:
-                        segment_outputs = [
-                            launch_segment(spec) for spec in segment_specs
-                        ]
+                        segment_outputs = [launch_segment(spec) for spec in segment_specs]
                     idx_parts, out_parts = zip(*segment_outputs)
                     idx_o = (
                         None
@@ -2345,6 +2590,24 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 dense_main_attn_fn=attn_fn,
                 page_size=self.page_size,
                 use_msa=self._use_msa_decode,
+                use_flash_mla_gfx938=self._flash_mla_decode_current,
+                use_flash_mla_gfx938_indexer=(
+                    self.use_flash_mla_gfx938_indexer
+                    and self._flash_mla_decode_current
+                ),
+                flash_mla_page_table=self._flash_mla_page_table,
+                flash_mla_sched_meta=(
+                    self._get_flash_mla_sched_meta(layer.layer_id, q.shape[0])
+                    if self._flash_mla_decode_current
+                    else None
+                ),
+                flash_mla_indices_output=(
+                    self._get_flash_mla_indices_output(
+                        q.shape[0], q.device, decode=True
+                    )
+                    if self._flash_mla_decode_current
+                    else None
+                ),
                 msa_kv_indices=msa_kv_indices,
                 msa_plan=msa_plan,
                 q_scale=layer.q_scale_float,

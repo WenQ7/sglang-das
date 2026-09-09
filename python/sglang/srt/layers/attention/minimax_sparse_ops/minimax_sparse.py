@@ -84,6 +84,10 @@ def minimax_sparse_prefill(
     score_type: str = "max",
     disable_index_value: bool = False,
     use_msa: bool = False,
+    use_flash_mla_gfx938: bool = False,
+    use_flash_mla_gfx938_indexer: bool = False,
+    flash_mla_page_table: Optional[torch.Tensor] = None,
+    flash_mla_indices_output: Optional[torch.Tensor] = None,
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
@@ -121,7 +125,13 @@ def minimax_sparse_prefill(
                 "MiniMax-M3 DCP2 prefill requires score_type='max' and "
                 "disable_index_value=True"
             )
-        if use_msa or sink is not None or idx_sink is not None:
+        if (
+            use_msa
+            or use_flash_mla_gfx938
+            or use_flash_mla_gfx938_indexer
+            or sink is not None
+            or idx_sink is not None
+        ):
             raise NotImplementedError(
                 "MiniMax-M3 DCP2 prefill requires Triton sparse attention "
                 "without sinks"
@@ -210,41 +220,68 @@ def minimax_sparse_prefill(
         os.environ.get("SGLANG_MINIMAX_PREFILL_FUSED_TOPK_UNION", "0") == "1"
     )
 
-    # All seqlen is less than topk, use full attention
-    # Step 1: Flash attention with topk index (using index head)
-    idx_o, topk_idx = flash_prefill_with_topk_index(
-        q=idx_q,
-        k_cache=idx_k_cache,
-        v_cache=idx_v_cache,
-        sink=idx_sink,
-        req_to_token=req_to_token,
-        slot_ids=slot_ids,
-        cu_seqlens=cu_seqlens,
-        seq_lens=seq_lens,
-        prefix_lens=prefix_lens,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=max_seqlen_k,
-        block_size_q=block_size_q,
-        block_size_k=block_size_k,
-        topk=topk,
-        init_blocks=init_blocks,
-        local_blocks=local_blocks,
-        sm_scale=idx_sm_scale,
-        score_type=score_type,
-        disable_index_value=disable_index_value,
-        cu_seqblocks_q=cu_seqblocks_q,
-        max_seqblock_q=max_seqblock_q,
-        all_seqblock_q=all_seqblock_q,
-        q_scale=idx_q_scale,
-        k_scale=idx_k_scale,
-        v_scale=idx_v_scale,
-        dcp_size=dcp_size,
-        dcp_rank=dcp_rank,
-        dcp_group=dcp_group,
-        # The fused union accepts score-ranked AITER ids and emits a sorted
-        # unique block-id row itself.  Keep sorting for every other consumer.
-        sort_topk_ids=not (use_exact_grouped_main and fused_topk_union),
-    )
+    # Step 1/2: index score and exact TopK.  Full gfx938 FlashMLA mode replaces
+    # both kernels; the established Triton/AITER producer remains the fallback.
+    if use_flash_mla_gfx938_indexer:
+        if score_type != "max" or not disable_index_value or idx_sink is not None:
+            raise NotImplementedError(
+                "gfx938 FlashMLA MSA128 indexer requires score_type=max, "
+                "disabled index value, and no index sink"
+            )
+        if flash_mla_page_table is None or seqlens_cpu is None:
+            raise RuntimeError(
+                "gfx938 FlashMLA prefill indexer requires page-table and CPU "
+                "query-length metadata"
+            )
+        from .flash_mla_gfx938 import flash_mla_sparse_prefill_indexer
+
+        idx_o = None
+        topk_idx = flash_mla_sparse_prefill_indexer(
+            idx_q,
+            idx_k_cache,
+            flash_mla_page_table,
+            cu_seqlens,
+            prefix_lens,
+            seqlens_cpu,
+            block_size_k,
+            topk,
+            init_blocks,
+            local_blocks,
+        )
+    else:
+        idx_o, topk_idx = flash_prefill_with_topk_index(
+            q=idx_q,
+            k_cache=idx_k_cache,
+            v_cache=idx_v_cache,
+            sink=idx_sink,
+            req_to_token=req_to_token,
+            slot_ids=slot_ids,
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            block_size_q=block_size_q,
+            block_size_k=block_size_k,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            sm_scale=idx_sm_scale,
+            score_type=score_type,
+            disable_index_value=disable_index_value,
+            cu_seqblocks_q=cu_seqblocks_q,
+            max_seqblock_q=max_seqblock_q,
+            all_seqblock_q=all_seqblock_q,
+            q_scale=idx_q_scale,
+            k_scale=idx_k_scale,
+            v_scale=idx_v_scale,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            dcp_group=dcp_group,
+            # The fused union accepts score-ranked AITER ids and emits a sorted
+            # unique block-id row itself. Keep sorting for every other consumer.
+            sort_topk_ids=not (use_exact_grouped_main and fused_topk_union),
+        )
     # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
     num_idx_heads = idx_q.shape[1]
     num_kv_heads = k_cache.shape[1]
@@ -346,10 +383,38 @@ def minimax_sparse_prefill(
             ) = get_cu_seqblocks(
                 cu_seqlens, max_seqlen_q, 1, block_size_k, seqlens_cpu
             )
-    # Step 3: Sparse attention using topk index (main head). The MSA path only
-    # replaces this step; the indexer above is unchanged. MSA has no attn-sink
-    # input, so keep the Triton path when sink is present.
-    if use_msa and sink is None:
+    # Step 3: Sparse attention using topk index (main head). External MSA
+    # backends replace only this consumer; MiniMax's score + exact Top16
+    # producer above remains authoritative. FlashMLA requires one exact Top16
+    # row per query, so use the saved rows when the Triton consumer grouped
+    # them for KV reuse.
+    if use_flash_mla_gfx938:
+        if sink is not None:
+            raise NotImplementedError(
+                "gfx938 FlashMLA MSA128 does not support MiniMax attention sinks"
+            )
+        from .flash_mla_gfx938 import flash_mla_sparse_prefill_main
+
+        exact_topk_idx = (
+            per_query_topk_idx if per_query_topk_idx is not None else topk_idx
+        )
+        o = flash_mla_sparse_prefill_main(
+            q=q_for_main,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            topk_idx=exact_topk_idx,
+            page_table=flash_mla_page_table,
+            cu_seqlens=cu_seqlens,
+            seq_lens=seq_lens,
+            prefix_lens=prefix_lens,
+            block_size_k=block_size_k,
+            indices_output=flash_mla_indices_output,
+            sm_scale=sm_scale,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+    elif use_msa and sink is None:
         from .msa import MSAUnavailableError, msa_sparse_prefill_main
 
         try:
@@ -460,6 +525,11 @@ def minimax_sparse_decode(
     dense_main_attn_fn: Optional[Callable] = None,
     page_size: int = 1,
     use_msa: bool = False,
+    use_flash_mla_gfx938: bool = False,
+    use_flash_mla_gfx938_indexer: bool = False,
+    flash_mla_page_table: Optional[torch.Tensor] = None,
+    flash_mla_sched_meta=None,
+    flash_mla_indices_output: Optional[torch.Tensor] = None,
     msa_kv_indices: Optional[
         torch.Tensor
     ] = None,  # per-forward MSA page table (cached)
@@ -490,7 +560,12 @@ def minimax_sparse_decode(
                 "MiniMax-M3 DCP2 requires score_type='max' and "
                 "disable_index_value=True"
             )
-        if dense_main_attn_fn is not None or use_msa:
+        if (
+            dense_main_attn_fn is not None
+            or use_msa
+            or use_flash_mla_gfx938
+            or use_flash_mla_gfx938_indexer
+        ):
             raise NotImplementedError(
                 "MiniMax-M3 DCP2 currently supports only the Triton sparse "
                 "main-attention path"
@@ -500,32 +575,62 @@ def minimax_sparse_decode(
     # Step 1: Flash decode with topk index (using index head). When the dense main
     # attention is used, the indexer emits the page table directly (fused
     # transform) instead of block ids, plus the per-query effective KV length.
-    idx_o, topk_idx, real_seq_lens = flash_decode_with_topk_idx(
-        q=idx_q,
-        sink=idx_sink,
-        k_cache=idx_k_cache,
-        v_cache=idx_v_cache,
-        req_to_token=req_to_token,
-        seq_lens=seq_lens,
-        max_seqlen=max_seqlen,
-        slot_ids=slot_ids,
-        block_size=block_size_k,
-        topk=topk,
-        init_blocks=init_blocks,
-        local_blocks=local_blocks,
-        sm_scale=idx_sm_scale,
-        score_type=score_type,
-        disable_index_value=disable_index_value,
-        use_dense_main_attn=dense_main_attn_fn is not None,
-        page_size=page_size,
-        q_scale=idx_q_scale,
-        k_scale=idx_k_scale,
-        v_scale=idx_v_scale,
-        dcp_size=dcp_size,
-        dcp_rank=dcp_rank,
-        dcp_group=dcp_group,
-        verify_group_size=verify_group_size,
-    )
+    if use_flash_mla_gfx938_indexer:
+        if (
+            score_type != "max"
+            or not disable_index_value
+            or idx_sink is not None
+            or dense_main_attn_fn is not None
+        ):
+            raise NotImplementedError(
+                "gfx938 FlashMLA MSA128 decode indexer requires score_type=max, "
+                "disabled index value, no index sink, and sparse main attention"
+            )
+        if flash_mla_page_table is None:
+            raise RuntimeError(
+                "gfx938 FlashMLA decode indexer requires a prepared page table"
+            )
+        from .flash_mla_gfx938 import flash_mla_sparse_decode_indexer
+
+        idx_o = None
+        topk_idx = flash_mla_sparse_decode_indexer(
+            idx_q,
+            idx_k_cache,
+            flash_mla_page_table,
+            seq_lens,
+            block_size_k,
+            topk,
+            init_blocks,
+            local_blocks,
+        )
+        real_seq_lens = seq_lens
+    else:
+        idx_o, topk_idx, real_seq_lens = flash_decode_with_topk_idx(
+            q=idx_q,
+            sink=idx_sink,
+            k_cache=idx_k_cache,
+            v_cache=idx_v_cache,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+            max_seqlen=max_seqlen,
+            slot_ids=slot_ids,
+            block_size=block_size_k,
+            topk=topk,
+            init_blocks=init_blocks,
+            local_blocks=local_blocks,
+            sm_scale=idx_sm_scale,
+            score_type=score_type,
+            disable_index_value=disable_index_value,
+            use_dense_main_attn=dense_main_attn_fn is not None,
+            page_size=page_size,
+            q_scale=idx_q_scale,
+            k_scale=idx_k_scale,
+            v_scale=idx_v_scale,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
+            dcp_group=dcp_group,
+            verify_group_size=verify_group_size,
+        )
     num_idx_heads = idx_q.shape[1]
     num_kv_heads = k_cache.shape[1]
     idx_group_size = num_idx_heads // num_kv_heads
@@ -547,9 +652,35 @@ def minimax_sparse_decode(
             if dcp_size > 1
             else q
         )
-        # Step 3: Sparse attention using topk index (main head). The MSA path
-        # only replaces this step; keep the Triton path when sink is present.
-        if use_msa and sink is None:
+        # Step 3: Sparse attention using topk index (main head). External
+        # backends replace only this consumer; score and Top16 stay unchanged.
+        if use_flash_mla_gfx938:
+            if sink is not None:
+                raise NotImplementedError(
+                    "gfx938 FlashMLA MSA128 does not support MiniMax attention sinks"
+                )
+            if flash_mla_sched_meta is None:
+                raise RuntimeError(
+                    "gfx938 FlashMLA decode scheduler metadata was not prepared"
+                )
+            from .flash_mla_gfx938 import flash_mla_sparse_decode_main
+
+            o = flash_mla_sparse_decode_main(
+                q=q_for_main,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                topk_idx=topk_idx,
+                page_table=flash_mla_page_table,
+                seq_lens=seq_lens,
+                block_size_k=block_size_k,
+                sched_meta=flash_mla_sched_meta,
+                indices_output=flash_mla_indices_output,
+                sm_scale=sm_scale,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+        elif use_msa and sink is None:
             from .msa import MSAUnavailableError, msa_sparse_decode_main
 
             try:

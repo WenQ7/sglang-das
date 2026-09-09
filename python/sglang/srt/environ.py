@@ -1409,6 +1409,19 @@ class Envs:
     SGLANG_OPT_USE_MINIMAX_DENSE_SPARSE_DECODE = EnvBool(False)
     SGLANG_DISABLE_MSA = EnvBool(False)
     SGLANG_OPT_USE_MSA_DECODE_UNDER_GRAPH = EnvBool(False)
+    # Opt-in gfx938 FlashMLA MSA128 Stage-3 path. The MiniMax lightning
+    # indexer remains the exact Top16 producer. The external kernels require
+    # BF16 Q/K/V, page128, and attention TP1 (64Q:4KV heads).
+    SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938 = EnvBool(False)
+    # Also replace the MiniMax score producer and exact Top16 selector with
+    # flash_mla's MSA128 Stage-1/2 kernels.  Kept separate from the Stage-3
+    # switch so each boundary can be differential-tested independently.
+    SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938_INDEXER = EnvBool(False)
+    # Decode has an independent gate so prefill and decode can be benchmarked
+    # separately. The currently installed wheel passes the raw large-cache,
+    # invalid-index and CUDA-graph replay regressions; keep this opt-in until
+    # full serving accuracy/performance gates are complete.
+    SGLANG_OPT_USE_MINIMAX_FLASH_MLA_GFX938_DECODE = EnvBool(False)
     # Kill switch for the derived fp8 attention-GEMM mode (m3_fp8_attn_gemm_enabled):
     # forces the pre-fp8 behavior (bf16 indexer + widening sparse path, bf16 q)
     # even when kv_cache_dtype fp8_e4m3 + trtllm_mha + SM100 would activate it.
