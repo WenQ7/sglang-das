@@ -198,9 +198,9 @@ class FlashAttentionBackend(AttentionBackend):
                 raise ValueError("hcu_fa is only available on HIP/HCU platforms.")
             if self.use_mla:
                 raise ValueError("hcu_fa currently supports MHA/GQA models, not MLA.")
-            if self.page_size != 64:
+            if self.page_size not in (64, 128):
                 raise ValueError(
-                    "hcu_fa on BW1100 currently requires --page-size 64; got "
+                    "hcu_fa on BW1100 currently requires --page-size 64 or 128; got "
                     f"{self.page_size}."
                 )
         # Unified pool: req_to_token holds VIRTUAL ids but the MLA per-layer views

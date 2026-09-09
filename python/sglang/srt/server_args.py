@@ -202,7 +202,7 @@ ATTENTION_BACKEND_CHOICES = [
     # AMD specific
     "aiter",
     "wave",
-    "hcu_fa",  # BW1100 flash_attn varlen_fwd_unified adapter, page-size 64
+    "hcu_fa",  # BW1100 flash_attn varlen_fwd_unified adapter, page-size 64/128
     # Other platforms
     "intel_amx",
     "ascend",

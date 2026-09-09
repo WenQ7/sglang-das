@@ -238,9 +238,9 @@ def create_hcu_flashattention_backend(runner):
         raise ValueError("hcu_fa is only available on HIP/HCU platforms.")
     if runner.use_mla_backend:
         raise ValueError("hcu_fa currently supports MHA/GQA models, not MLA.")
-    if runner.page_size != 64:
+    if runner.page_size not in (64, 128):
         raise ValueError(
-            "hcu_fa on BW1100 currently requires --page-size 64; got "
+            "hcu_fa on BW1100 currently requires --page-size 64 or 128; got "
             f"{runner.page_size}."
         )
     from sglang.srt.layers.attention.flashattention_backend import (
