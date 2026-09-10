@@ -55,6 +55,7 @@ from sglang.srt.runtime_context import (
     set_global_dwdp_manager,
 )
 from sglang.srt.utils import (
+    get_bool_env_var,
     get_current_device_stream_fast,
     get_int_env_var,
     is_cpu,
@@ -1145,8 +1146,16 @@ class GroupCoordinator:
                     ca_comm.reduce_scatter(input, output, registered=True)
             elif is_in_tc_piecewise_cuda_graph():
                 ca_comm.reduce_scatter(input, output, registered=False)
+            elif get_bool_env_var(
+                "SGLANG_AITER_AR_REAL_GRAPH_WARMUP", default="true"
+            ):
+                # AITER's registered buffers only become valid during the real
+                # HIP graph capture.  SGLang nevertheless consumes outputs
+                # from the preceding eager warmup, so a zero placeholder can
+                # poison residual/speculative state before capture starts.
+                ca_comm.reduce_scatter(input, output, registered=False)
             else:
-                # True CUDA graph warmup: avoid a different host collective.
+                # Compatibility escape hatch for AITER's legacy placeholder.
                 output.zero_()
             return True
         ca_comm.reduce_scatter(input, output, registered=False)
@@ -1244,8 +1253,16 @@ class GroupCoordinator:
                         ca_comm.all_gather_reg(input, out=output, dim=0)
                 elif is_in_tc_piecewise_cuda_graph():
                     ca_comm.all_gather_unreg(input, out=output, dim=0)
+                elif get_bool_env_var(
+                    "SGLANG_AITER_AR_REAL_GRAPH_WARMUP", default="true"
+                ):
+                    # Match all-reduce/reduce-scatter: graph warmup must
+                    # produce the real value even though no HIP capture is
+                    # active yet.  The subsequent capture still uses the
+                    # registered graph-input path above.
+                    ca_comm.all_gather_unreg(input, out=output, dim=0)
                 else:
-                    # True CUDA graph warmup: avoid a different host collective.
+                    # Compatibility escape hatch for AITER's legacy placeholder.
                     output.zero_()
                 return
             else:
