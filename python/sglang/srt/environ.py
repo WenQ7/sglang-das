@@ -1445,6 +1445,17 @@ class Envs:
     # decode-graph capture, issue that TP-sharded branch on a HIP side stream
     # while router + routed experts stay on the main stream.
     SGLANG_OPT_USE_MINIMAX_STANDARD_EP_SHARED_EXPERT_OVERLAP = EnvBool(False)
+    # Backward-compatible FP8-specific spelling for the following generic gate.
+    SGLANG_OPT_USE_EAGLE3_FP8_LM_HEAD_TOP1 = EnvBool(False)
+    # EAGLE3-only greedy draft path: reduce Top-1 immediately after each
+    # rank-local LM-head GEMM and exchange one candidate per TP rank instead of
+    # full-vocabulary logits. The backend controls BF16 versus FP8 computation.
+    SGLANG_OPT_USE_EAGLE3_LM_HEAD_TOP1 = EnvBool(False)
+    # Implementation behind the preceding gate. ``lightop`` materializes one
+    # TP-local vocabulary shard before Top-1; ``triton_fused`` keeps each GEMM
+    # vocabulary tile in registers and writes only tile winners. The latter is
+    # experimental until gfx938 accuracy/performance gating is complete.
+    SGLANG_EAGLE3_LM_HEAD_TOP1_BACKEND = EnvStr("lightop_fp8")
     # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
     # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.
     SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)

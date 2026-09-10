@@ -13,14 +13,21 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_spec
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import (
+    add_prefix,
+    get_bool_env_var,
+    is_hip,
+    log_info_on_rank0,
+)
 
 # Adapted from
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
 """Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
 
 import copy
+import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -39,6 +46,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM, LlamaMLP
+
+logger = logging.getLogger(__name__)
 
 
 class LlamaDecoderLayer(LlamaDecoderLayer):
@@ -331,6 +340,129 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
 
         self.capture_aux_hidden_states = True
         self.hot_token_id = None
+        self.use_fp8_lm_head_top1 = (
+            is_hip()
+            and (
+                envs.SGLANG_OPT_USE_EAGLE3_LM_HEAD_TOP1.get()
+                or envs.SGLANG_OPT_USE_EAGLE3_FP8_LM_HEAD_TOP1.get()
+            )
+        )
+        self.fp8_lm_head_top1_backend = envs.SGLANG_EAGLE3_LM_HEAD_TOP1_BACKEND.get()
+        self.register_buffer("_fp8_lm_head_weight", None, persistent=False)
+        self.register_buffer("_fp8_lm_head_scale", None, persistent=False)
+
+    def post_load_weights(self) -> None:
+        if not self.use_fp8_lm_head_top1:
+            return
+        if self.fp8_lm_head_top1_backend not in (
+            "lightop",
+            "lightop_fp8",
+            "triton_fused",
+            "triton_fp8_fused",
+            "triton_bf16_fused",
+        ):
+            raise RuntimeError(
+                "SGLANG_EAGLE3_LM_HEAD_TOP1_BACKEND must be lightop_fp8, "
+                "triton_fp8_fused, or triton_bf16_fused; got "
+                f"{self.fp8_lm_head_top1_backend!r}"
+            )
+        if self._fp8_lm_head_weight is not None:
+            return
+        spec = get_spec()
+        if spec.speculative_eagle_topk not in (None, 1):
+            raise RuntimeError(
+                "fused EAGLE3 draft Top-1 requires "
+                "--speculative-eagle-topk 1"
+            )
+        if spec.speculative_use_rejection_sampling:
+            raise RuntimeError(
+                "fused draft Top-1 is incompatible with rejection sampling"
+            )
+        weight = getattr(self.lm_head, "weight", None)
+        if weight is None or weight.dtype not in (torch.float16, torch.bfloat16):
+            raise RuntimeError(
+                "fused draft Top-1 currently requires an unquantized FP16/BF16 "
+                f"ParallelLMHead, got {getattr(weight, 'dtype', None)}"
+            )
+        if getattr(self.lm_head, "bias", None) is not None:
+            raise RuntimeError("fused draft Top-1 does not support an LM-head bias")
+        if self.lm_head.num_embeddings != self.lm_head.org_vocab_size:
+            raise RuntimeError("fused draft Top-1 does not support added vocabulary")
+        if self.fp8_lm_head_top1_backend == "triton_bf16_fused":
+            if weight.dtype != torch.bfloat16:
+                raise RuntimeError(
+                    "triton_bf16_fused requires a BF16 draft LM-head, got "
+                    f"{weight.dtype}"
+                )
+            log_info_on_rank0(
+                logger,
+                "EAGLE3 draft LM head uses fused BF16 GEMM + Top-1; "
+                "no vocabulary logits tensor is materialized.",
+            )
+            return
+        if not get_bool_env_var("SGLANG_USE_LIGHTOP_CHANNEL_FP8"):
+            raise RuntimeError(
+                "FP8 draft Top-1 on gfx938 requires "
+                "SGLANG_USE_LIGHTOP_CHANNEL_FP8=1"
+            )
+        from sglang.kernels.ops.speculative.fp8_lm_head_top1 import (
+            quantize_lm_head_weight_fp8_per_channel,
+        )
+
+        self._fp8_lm_head_weight, self._fp8_lm_head_scale = (
+            quantize_lm_head_weight_fp8_per_channel(weight)
+        )
+        log_info_on_rank0(
+            logger,
+            "EAGLE3 draft LM head uses per-channel FP8 GEMM + Top-1; "
+            "full-vocabulary logits and their TP AllGather are disabled "
+            f"(backend={self.fp8_lm_head_top1_backend}).",
+        )
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        get_embedding: bool = False,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
+    ):
+        hidden_states, aux_hidden_states = self.model(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+        if not self.pp_group.is_last_rank:
+            return hidden_states
+        if get_embedding:
+            raise RuntimeError("EAGLE3 draft model does not expose embeddings")
+        if self.use_fp8_lm_head_top1:
+            if (
+                self.fp8_lm_head_top1_backend != "triton_bf16_fused"
+                and self._fp8_lm_head_weight is None
+            ):
+                raise RuntimeError("FP8 draft LM-head weights were not initialized")
+            return self.logits_processor.forward_draft_top1_fp8(
+                input_ids,
+                hidden_states,
+                self.lm_head,
+                forward_batch,
+                self._fp8_lm_head_weight,
+                self._fp8_lm_head_scale,
+                aux_hidden_states,
+                backend=self.fp8_lm_head_top1_backend,
+            )
+        return self.logits_processor(
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            aux_hidden_states,
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         params_dict = dict(self.named_parameters())
@@ -386,6 +518,13 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+        # DefaultModelLoader expects model-owned ``load_weights`` methods to
+        # run their post-load derivations themselves.  The FP8 draft LM-head
+        # buffer is one such derivation and must exist before CUDA-graph
+        # warmup calls ``forward``.  ``post_load_weights`` is idempotent, so
+        # loaders that also invoke the generic hook remain safe.
+        self.post_load_weights()
 
     def get_hot_token_id(self):
         return self.hot_token_id

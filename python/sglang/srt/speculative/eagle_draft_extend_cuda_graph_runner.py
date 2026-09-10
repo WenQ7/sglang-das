@@ -65,7 +65,7 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
     extend_seq_lens: torch.Tensor
     num_correct_drafts: torch.Tensor
     num_accept_tokens: torch.Tensor
-    next_token_logits_buffer: torch.Tensor
+    next_token_logits_buffer: Optional[torch.Tensor]
     global_num_tokens_gpu: Optional[torch.Tensor]
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor]
     dsa_seed_topk_capture: Optional[torch.Tensor] = None
@@ -223,7 +223,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
                 vocab_size = self.model_runner.model_config.vocab_size
 
             next_token_logits_buffer = (
-                self.model_runner.graph_shared_output.get_logits_buffer(
+                None
+                if getattr(
+                    self.model_runner.model, "use_fp8_lm_head_top1", False
+                )
+                else self.model_runner.graph_shared_output.get_logits_buffer(
                     vocab_size, rows=self.max_bs * self.captured_req_width
                 )
             )
@@ -342,7 +346,11 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
         )
         num_correct_drafts = buffers.num_correct_drafts[:bs]
         num_accept_tokens = buffers.num_accept_tokens[:bs]
-        next_token_logits_buffer = buffers.next_token_logits_buffer[:num_tokens]
+        next_token_logits_buffer = (
+            buffers.next_token_logits_buffer[:num_tokens]
+            if buffers.next_token_logits_buffer is not None
+            else None
+        )
 
         # pruned_states = num_tokens (all tokens)
         num_tokens_for_logprob = num_tokens
@@ -603,7 +611,16 @@ class EAGLEDraftExtendCudaGraphRunner(DecodeCudaGraphRunner):
             out = self._replay_graph(shape_key, static_forward_batch)
 
         out = LogitsProcessorOutput(
-            next_token_logits=out.next_token_logits[:num_tokens],
+            next_token_logits=(
+                out.next_token_logits[:num_tokens]
+                if out.next_token_logits is not None
+                else None
+            ),
             hidden_states=out.hidden_states[:num_tokens],
+            draft_topk_index=(
+                out.draft_topk_index[:num_tokens]
+                if out.draft_topk_index is not None
+                else None
+            ),
         )
         return out

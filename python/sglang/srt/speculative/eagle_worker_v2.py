@@ -671,13 +671,23 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     logits_output = self.draft_runner.forward(
                         forward_batch
                     ).logits_output
-                maybe_detect_nan(
-                    logits_output.next_token_logits, f"draft_forward step {i}"
-                )
-                maybe_detect_inf(
-                    logits_output.next_token_logits, f"draft_forward step {i}"
-                )
-                if get_spec().speculative_use_rejection_sampling:
+                direct_top1 = logits_output.draft_topk_index
+                if direct_top1 is None:
+                    maybe_detect_nan(
+                        logits_output.next_token_logits, f"draft_forward step {i}"
+                    )
+                    maybe_detect_inf(
+                        logits_output.next_token_logits, f"draft_forward step {i}"
+                    )
+                if direct_top1 is not None:
+                    if self.topk != 1 or get_spec().speculative_use_rejection_sampling:
+                        raise RuntimeError(
+                            "direct draft Top-1 requires topk=1 without rejection sampling"
+                        )
+                    topk_index = direct_top1
+                    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                    forward_batch.positions.add_(1)
+                elif get_spec().speculative_use_rejection_sampling:
                     probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info.temperatures,
@@ -709,8 +719,8 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_oob(
                     topk_index,
                     0,
-                    logits_output.next_token_logits.shape[-1],
-                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                    self.draft_runner.model_config.vocab_size,
+                    f"draft_forward step {i}: topk_index OOB",
                 )
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
@@ -830,8 +840,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         with canary_ctx:
             logits_output = self.draft_runner.forward(forward_batch).logits_output
-        maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
-        maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
+        direct_top1 = logits_output.draft_topk_index
+        if direct_top1 is None:
+            maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
+            maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
 
         prefill_dsa_topk = None
         if seed_from_extend:
@@ -839,15 +851,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
-        if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
+        if direct_top1 is not None:
+            if self.topk != 1 or use_rejection_sampling:
+                raise RuntimeError(
+                    "direct draft Top-1 requires topk=1 without rejection sampling"
+                )
+            probs = None
+            topk_index = direct_top1
+            topk_p = torch.ones_like(topk_index, dtype=torch.float32)
         else:
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits,
+                batch.sampling_info,
+                use_rejection_sampling,
+            )
+            if use_rejection_sampling:
+                topk_p, topk_index = fast_sample(probs, num_samples=1)
+            else:
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
@@ -952,14 +973,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_batch
                 ).logits_output
 
-        maybe_detect_nan(
-            draft_logits_output.next_token_logits,
-            f"draft_extend_for_decode (cuda_graph={can_run_decode_cuda_graph})",
-        )
-        maybe_detect_inf(
-            draft_logits_output.next_token_logits,
-            f"draft_extend_for_decode (cuda_graph={can_run_decode_cuda_graph})",
-        )
+        direct_top1 = draft_logits_output.draft_topk_index
+        if direct_top1 is None:
+            maybe_detect_nan(
+                draft_logits_output.next_token_logits,
+                f"draft_extend_for_decode (cuda_graph={can_run_decode_cuda_graph})",
+            )
+            maybe_detect_inf(
+                draft_logits_output.next_token_logits,
+                f"draft_extend_for_decode (cuda_graph={can_run_decode_cuda_graph})",
+            )
 
         # Gather the per-request last-position indexer top-k as the next loop's
         # seed (select_index already picks the last accepted position per req).
@@ -975,16 +998,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             dsa_seed_topk_indices = dsa_extend_topk_capture[select_index]
 
         # Reorganize the spec info for the next batch
-        draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
-            select_index
-        ]
+        if direct_top1 is not None:
+            direct_top1 = direct_top1[select_index]
+        else:
+            draft_logits_output.next_token_logits = (
+                draft_logits_output.next_token_logits[select_index]
+            )
         if draft_logits_output.hidden_states is not None:
             draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                 select_index
             ]
         # The draft-extend graph only anchors full logits; selected-row topk is
         # owned by the worker for both graph and eager paths.
-        if get_spec().speculative_use_rejection_sampling:
+        if direct_top1 is not None:
+            if self.topk != 1 or get_spec().speculative_use_rejection_sampling:
+                raise RuntimeError(
+                    "direct draft Top-1 requires topk=1 without rejection sampling"
+                )
+            ret_topk_index = direct_top1
+            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            ret_draft_probs = None
+        elif get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,

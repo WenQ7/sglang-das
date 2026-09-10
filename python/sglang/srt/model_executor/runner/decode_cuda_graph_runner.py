@@ -1445,6 +1445,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     if output.hidden_states is not None
                     else None
                 ),
+                draft_topk_index=(
+                    output.draft_topk_index[: self.raw_num_token]
+                    if output.draft_topk_index is not None
+                    else None
+                ),
                 customized_info=output.customized_info,
             )
         else:

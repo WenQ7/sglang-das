@@ -102,6 +102,9 @@ class LogitsProcessorOutput:
     # Used by speculative decoding (EAGLE)
     # The last hidden layers
     hidden_states: Optional[torch.Tensor] = None
+    # Greedy EAGLE3 fast path.  When populated, the draft worker consumes
+    # these ids directly and ``next_token_logits`` is intentionally None.
+    draft_topk_index: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -425,6 +428,125 @@ class LogitsProcessor(nn.Module):
         )
         logprobs_result.write_input_to(logits_output)
         return logits_output
+
+    def forward_draft_top1_fp8(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: Union[LogitsMetadata, ForwardBatch],
+        fp8_weight: Optional[torch.Tensor],
+        weight_scale: Optional[torch.Tensor],
+        aux_hidden_states: Optional[AuxHiddenStates] = None,
+        backend: str = "lightop",
+    ) -> LogitsProcessorOutput:
+        """Greedy EAGLE3 LM-head without materializing vocabulary logits."""
+        from sglang.kernels.ops.speculative.fp8_lm_head_top1 import (
+            bf16_lm_head_top1_fused,
+            fp8_lm_head_top1,
+            fp8_lm_head_top1_fused,
+        )
+        from sglang.kernels.ops.speculative.topk1 import (
+            draft_topk1_select_candidates,
+        )
+
+        if isinstance(logits_metadata, ForwardBatch):
+            logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
+        if logits_metadata.extend_return_logprob:
+            raise RuntimeError("FP8 draft Top-1 does not support input logprobs")
+        if self.final_logit_softcapping is not None:
+            raise RuntimeError("FP8 draft Top-1 does not support logit softcapping")
+        (
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            _,
+            _,
+        ) = self._get_pruned_states(
+            hidden_states,
+            None,
+            aux_hidden_states,
+            logits_metadata,
+        )
+        hidden_states_to_store = self._get_hidden_states_to_store(
+            hidden_states,
+            None,
+            aux_hidden_states,
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            logits_metadata,
+        )
+        pruned_states, local_states = self._gather_dp_attn_hidden_states(
+            pruned_states, logits_metadata
+        )
+
+        shard = lm_head.shard_indices
+        if shard.num_added_elements != 0:
+            raise RuntimeError("FP8 draft Top-1 does not support added vocabulary")
+        valid_local_vocab = shard.org_vocab_end_index - shard.org_vocab_start_index
+        # Large prefill batches are not the intended fused-kernel shape. Keep
+        # the serving path robust by falling back to tuned hipBLASLt instead of
+        # failing a request when an unusual draft batch exceeds the graph set.
+        use_fused_shape = pruned_states.shape[0] <= 8
+        if backend == "triton_bf16_fused" and use_fused_shape:
+            local_values, local_indices = bf16_lm_head_top1_fused(
+                pruned_states,
+                lm_head.weight,
+                valid_vocab_size=valid_local_vocab,
+            )
+        else:
+            if fp8_weight is None or weight_scale is None:
+                # Unusual M>8 BF16 batches retain correctness through the
+                # ordinary LM-head, because no FP8 fallback weights exist.
+                local_logits = self._compute_lm_head(pruned_states, lm_head)
+                local_values, local_indices = draft_topk1_argmax(
+                    local_logits[:, :valid_local_vocab].contiguous()
+                )
+            else:
+                local_top1_op = (
+                    fp8_lm_head_top1_fused
+                    if backend in ("triton_fused", "triton_fp8_fused")
+                    and use_fused_shape
+                    else fp8_lm_head_top1
+                )
+                local_values, local_indices = local_top1_op(
+                    pruned_states,
+                    fp8_weight,
+                    weight_scale,
+                    valid_vocab_size=valid_local_vocab,
+                )
+        global_ids = local_indices.to(torch.float32).add_(
+            shard.org_vocab_start_index
+        )
+        candidates = torch.stack((local_values, global_ids), dim=-1)
+        if self.do_tensor_parallel_all_gather:
+            if self.use_attn_tp_group:
+                raise RuntimeError(
+                    "FP8 draft Top-1 currently requires the model TP group"
+                )
+            candidates = get_tp_group().all_gather(candidates, dim=-1)
+            candidates = candidates.view(candidates.shape[0], -1, 2)
+            global_top1 = draft_topk1_select_candidates(candidates)
+        else:
+            global_top1 = global_ids.to(torch.int64).view(-1, 1).contiguous()
+        if self.do_tensor_parallel_all_gather_dp_attn:
+            local_top1 = torch.empty(
+                (local_states.shape[0], 1),
+                dtype=torch.int64,
+                device=global_top1.device,
+            )
+            dp_scatter(local_top1, global_top1, logits_metadata)
+        else:
+            local_top1 = global_top1
+        return LogitsProcessorOutput(
+            next_token_logits=None,
+            hidden_states=hidden_states_to_store,
+            draft_topk_index=local_top1,
+            mm_input_embeds=logits_metadata.mm_input_embeds,
+        )
 
     def _get_pruned_states(
         self,
