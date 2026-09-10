@@ -265,7 +265,8 @@ def _forward_with_allreduce_fusion(
     """Shared allreduce-fused RMSNorm logic usable by any norm."""
     if residual is not None:
         from sglang.srt.distributed import (
-            tensor_model_parallel_all_reduce,
+            attention_tensor_model_parallel_all_reduce,
+            moe_tensor_model_parallel_all_reduce,
             tensor_model_parallel_fused_allreduce_rmsnorm,
         )
         from sglang.srt.layers.flashinfer_comm_fusion import (
@@ -274,24 +275,34 @@ def _forward_with_allreduce_fusion(
 
         if use_attn_tp_group:
             world_size = get_parallel().attn_tp_size
+            allreduce_group = "attn_tp"
+            all_reduce = attention_tensor_model_parallel_all_reduce
         else:
-            if get_parallel().moe_ep_size > 1:
-                world_size = get_parallel().moe_ep_size
-            else:
-                world_size = get_parallel().moe_tp_size
+            world_size = get_parallel().moe_tp_size
+            allreduce_group = "moe_tp"
+            all_reduce = moe_tensor_model_parallel_all_reduce
 
         if world_size > 1:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
 
-            # Prefer AITER fused AR+RMSNorm when enabled on AMD.
-            if _use_aiter:
+            # The AITER communicator is independently selectable from the
+            # global AITER compute backend. MiniMax keeps SGLANG_USE_AITER=0
+            # for its LightOp dense FP8 path while still using AITER custom AR.
+            use_aiter_ar = (
+                _is_hip and get_exec().comm.enable_aiter_allreduce_fusion
+            )
+            if use_aiter_ar:
                 fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
-                    x, residual, weight, norm_module.variance_epsilon
+                    x,
+                    residual,
+                    weight,
+                    norm_module.variance_epsilon,
+                    group=allreduce_group,
                 )
                 if fused_result is not None:
                     return fused_result
-            else:
+            elif not _is_hip:
                 fused_result = flashinfer_allreduce_residual_rmsnorm(
                     input_tensor=x,
                     residual=residual,
@@ -304,8 +315,8 @@ def _forward_with_allreduce_fusion(
                     return fused_result
 
             # For AITER route, preserve correctness when fused path is unavailable.
-            if _use_aiter and get_exec().comm.enable_aiter_allreduce_fusion:
-                x = tensor_model_parallel_all_reduce(x)
+            if use_aiter_ar:
+                x = all_reduce(x)
                 return norm_module.forward(x, residual, None)
 
     return norm_module.forward(x, residual, post_residual_addition)
@@ -361,11 +372,10 @@ def _forward_with_allreduce_fusion_quant_per_group(
 
     if use_attn_tp_group:
         world_size = get_parallel().attn_tp_size
+        allreduce_group = "attn_tp"
     else:
-        if get_parallel().moe_ep_size > 1:
-            world_size = get_parallel().moe_ep_size
-        else:
-            world_size = get_parallel().moe_tp_size
+        world_size = get_parallel().moe_tp_size
+        allreduce_group = "moe_tp"
     if world_size <= 1:
         return None
 
@@ -374,7 +384,12 @@ def _forward_with_allreduce_fusion_quant_per_group(
     # and drop this explicit post-kernel scale materialization.
     if not keep_bf16:
         result = tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
-            x, residual, weight, norm_module.variance_epsilon, group_size
+            x,
+            residual,
+            weight,
+            norm_module.variance_epsilon,
+            group_size,
+            group=allreduce_group,
         )
         if result is not None:
             fp8_out, residual_out, scale_out = result
@@ -384,7 +399,11 @@ def _forward_with_allreduce_fusion_quant_per_group(
 
         # Fallback: fused AR+RMSNorm then separate per-group quant.
         fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
-            x, residual, weight, norm_module.variance_epsilon
+            x,
+            residual,
+            weight,
+            norm_module.variance_epsilon,
+            group=allreduce_group,
         )
         if fused_result is None:
             return None
@@ -411,6 +430,7 @@ def _forward_with_allreduce_fusion_quant_per_group(
         norm_module.variance_epsilon,
         group_size,
         emit_bf16=True,
+        group=allreduce_group,
     )
     if result is not None and len(result) == 4:
         fp8_out, residual_out, scale_out, bf16_out = result
@@ -419,7 +439,11 @@ def _forward_with_allreduce_fusion_quant_per_group(
         return (bf16_out, fp8_out, scale_out), residual_out
 
     fused_result = tensor_model_parallel_fused_allreduce_rmsnorm(
-        x, residual, weight, norm_module.variance_epsilon
+        x,
+        residual,
+        weight,
+        norm_module.variance_epsilon,
+        group=allreduce_group,
     )
     if fused_result is None:
         return None
