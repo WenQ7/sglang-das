@@ -105,6 +105,7 @@ from sglang.srt.utils.common import (
     empty_context,
     fast_topk,
     get_available_gpu_memory,
+    is_gfx938_supported,
     is_cpu,
     is_cuda,
     is_hip,
@@ -120,6 +121,7 @@ _is_npu = is_npu()
 _is_cuda = is_cuda()
 _is_musa = is_musa()
 _is_hip = is_hip()
+_is_gfx938 = is_gfx938_supported()
 _is_xpu = is_xpu()
 
 
@@ -414,7 +416,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
             supports_hip_draft_extend_graph = isinstance(
                 self.draft_attn_backend, AiterMultiStepDraftBackend
-            ) or isinstance(self.draft_extend_attn_backend, DeepseekV4HipRadixBackend)
+            ) or isinstance(
+                self.draft_extend_attn_backend, DeepseekV4HipRadixBackend
+            )
+            supports_hip_draft_extend_graph = (
+                supports_hip_draft_extend_graph
+                or _is_gfx938
+                and isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
+            )
+            if _is_gfx938 and isinstance(
+                self.draft_extend_attn_backend, TritonAttnBackend
+            ):
+                log_info_on_rank0(
+                    logger,
+                    "HIP EAGLE draft-extend graph enabled for Triton attention.",
+                )
 
         graph_supported_backend_types = [
             TritonAttnBackend,

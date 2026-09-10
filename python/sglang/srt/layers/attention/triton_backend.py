@@ -11,6 +11,7 @@ from sglang.kernels.ops.speculative.cache_locs import (
     generate_draft_decode_kv_indices_windowed_topk1,
 )
 from sglang.kernels.ops.kvcache.kv_indices import (
+    create_draft_extend_kv_metadata_triton,
     create_flashinfer_kv_indices_triton,
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
@@ -50,11 +51,14 @@ from sglang.srt.utils import (
     is_gfx938_supported,
     is_gfx95_supported,
     is_gfx942_supported,
+    is_hip,
     is_xpu,
     next_power_of_2,
 )
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
+_is_gfx938 = is_gfx938_supported()
 _is_gfx942 = is_gfx942_supported()
 _is_xpu = is_xpu()
 
@@ -140,6 +144,28 @@ class TritonAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
+
+    def draft_extend_metadata_captured_in_graph(self) -> bool:
+        # The fused draft-extend metadata kernel below is graph-safe when KV
+        # slots are already physical and no secondary SWA table is required.
+        # Unified pools need a live virtual-to-physical translation outside the
+        # graph, so they deliberately retain the replay-prep path.
+        return _is_gfx938 and self._translate_kv_loc is None and not (
+            self.sliding_window_size is not None and self.sliding_window_size > 0
+        )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        if (
+            forward_batch.forward_mode.is_draft_extend_v2()
+            and self.draft_extend_metadata_captured_in_graph()
+        ):
+            self._apply_cuda_graph_metadata(
+                bs=forward_batch.batch_size,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                forward_mode=forward_batch.forward_mode,
+                spec_info=forward_batch.spec_info,
+            )
 
     def __init__(
         self,
@@ -599,13 +625,6 @@ class TritonAttnBackend(AttentionBackend):
             else self.speculative_num_steps + 1
         )
         qo_indptr = self.qo_indptr[: bs + 1]
-        qo_indptr[: bs + 1] = torch.arange(
-            0,
-            bs * num_tokens_per_req + 1,
-            step=num_tokens_per_req,
-            dtype=torch.int32,
-            device=self.device,
-        )
         # DRAFT_EXTEND_V2: kv_indptr/kv_indices cover only the prefix (extend K/V go
         # separately). Capture warmup lacks extend_seq_lens_tensor -> fall back to
         # zeros; clamp at 0 so padded rows (seq_lens==fill 1) don't go negative.
@@ -616,10 +635,56 @@ class TritonAttnBackend(AttentionBackend):
             extend_seq_lens = spec_info.extend_seq_lens_tensor[:bs].to(torch.int32)
         else:
             extend_seq_lens = torch.zeros(bs, dtype=torch.int32, device=seq_lens.device)
-        kv_lens = torch.clamp(seq_lens - extend_seq_lens, min=0).to(torch.int32)
-        kv_indptr = self._fill_kv_indptr_and_indices(
-            bs, kv_lens, req_pool_indices, self.cuda_graph_kv_indices
-        )
+        if _is_gfx938:
+            kv_indptr = self.kv_indptr[: bs + 1]
+            create_draft_extend_kv_metadata_triton[(bs,)](
+                self.req_to_token,
+                req_pool_indices,
+                seq_lens,
+                extend_seq_lens,
+                kv_indptr,
+                qo_indptr,
+                self.cuda_graph_kv_indices,
+                self.req_to_token.stride(0),
+                NUM_TOKENS_PER_REQ=num_tokens_per_req,
+                BS_BLOCK=triton.next_power_of_2(bs),
+            )
+        else:
+            qo_indptr[: bs + 1] = torch.arange(
+                0,
+                bs * num_tokens_per_req + 1,
+                step=num_tokens_per_req,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            kv_lens = torch.clamp(seq_lens - extend_seq_lens, min=0).to(
+                torch.int32
+            )
+            kv_indptr = self._fill_kv_indptr_and_indices(
+                bs, kv_lens, req_pool_indices, self.cuda_graph_kv_indices
+            )
+
+        # The draft checkpoint can mix full and sliding-window attention.  The
+        # full-prefix metadata above is not sufficient for SWA layers: those
+        # layers read window_kv_* unconditionally in forward_extend().  Keep
+        # the window views capture-stable as well.  On HIP this remains an
+        # out-of-graph replay-prep path for SWA (draft_extend_metadata_captured_
+        # in_graph() deliberately returns False), while the model forward itself
+        # is still captured by the draft-extend graph.
+        if self.sliding_window_size is not None and self.sliding_window_size > 0:
+            prefix_lens = torch.clamp(seq_lens - extend_seq_lens, min=0)
+            _, _, _, window_kv_offsets = update_sliding_window_buffer(
+                self.window_kv_indptr,
+                self.req_to_token,
+                self.sliding_window_size,
+                prefix_lens,
+                req_pool_indices,
+                bs,
+                token_to_kv_pool=self.token_to_kv_pool,
+                window_kv_indices=self.cuda_graph_window_kv_indices,
+                skip_full_to_swa_translation=(self._translate_kv_loc is not None),
+            )
+            self.cuda_graph_window_kv_offsets[:bs].copy_(window_kv_offsets[:bs])
         return qo_indptr, kv_indptr, num_tokens_per_req
 
     def init_forward_metadata_out_graph(
@@ -1217,6 +1282,7 @@ class TritonAttnBackend(AttentionBackend):
                 out_cache_loc_full_physical=out_cache_loc_full_physical,
             )
         elif forward_mode.is_draft_extend_v2():
+            swa = self.sliding_window_size is not None and self.sliding_window_size > 0
             return ForwardMetadata(
                 attn_logits=None,
                 attn_lse=None,
@@ -1235,10 +1301,14 @@ class TritonAttnBackend(AttentionBackend):
                 qo_indptr=self.qo_indptr[: bs + 1],
                 custom_mask=None,
                 mask_indptr=None,
-                window_kv_indptr=self.window_kv_indptr,
-                window_kv_indices=None,
+                window_kv_indptr=(self.window_kv_indptr[: bs + 1] if swa else None),
+                window_kv_indices=(
+                    self.cuda_graph_window_kv_indices if swa else None
+                ),
                 window_num_kv_splits=None,
-                window_kv_offsets=None,
+                window_kv_offsets=(
+                    self.cuda_graph_window_kv_offsets[:bs] if swa else None
+                ),
                 swa_out_cache_loc=swa_out_cache_loc,
                 out_cache_loc_full_physical=out_cache_loc_full_physical,
             )
