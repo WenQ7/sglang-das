@@ -129,6 +129,27 @@ _fuse_lightop_channel_fp8_qkv_index = (
     )
 )
 
+# Fuse the input Gemma RMSNorm with the dynamic activation quantization already
+# required by channel-wise FP8 QKV projections.  Keep this independent and
+# opt-in so it can be A/B tested without changing other models or FP8 schemes.
+_use_lightop_gemma_rmsnorm_fp8_quant = (
+    _is_hip
+    and get_bool_env_var("SGLANG_USE_LIGHTOP_CHANNEL_FP8")
+    and get_bool_env_var("SGLANG_USE_LIGHTOP_GEMMA_RMSNORM")
+    and get_bool_env_var(
+        "SGLANG_OPT_USE_MINIMAX_LIGHTOP_GEMMA_RMSNORM_FP8_QUANT",
+        default="false",
+    )
+)
+
+# Restore the cross-layer MoE all-reduce + residual-add + input-RMSNorm
+# fusion only for layouts where the deferred partial and residual already have
+# identical token ownership.  DP-attention, CP reduce-scatter and standard
+# hybrid EP require layout conversion and are deliberately excluded.
+_use_minimax_aiter_fused_ar_rmsnorm = _is_hip and get_bool_env_var(
+    "SGLANG_OPT_USE_MINIMAX_AITER_FUSED_AR_RMSNORM", default="false"
+)
+
 # The generic HIP BF16->FP32 GEMM is disproportionately expensive for the
 # decode router shape [M, 6144] x [128, 6144]^T (M <= 16). Keep the
 # specialized GEMV opt-in at framework level; the MiniMax performance script
@@ -1484,6 +1505,15 @@ class MiniMaxM3DecoderLayer(nn.Module):
             is_sparse_attention_layer=is_sparse_attention_layer,
             disable_index_value=disable_index_value,
         )
+        qkv_scheme = getattr(self.self_attn.qkv_proj, "scheme", None)
+        qkv_strategy = getattr(qkv_scheme, "strategy", None)
+        self.use_lightop_gemma_rmsnorm_fp8_quant = (
+            _use_lightop_gemma_rmsnorm_fp8_quant
+            and getattr(qkv_strategy, "value", qkv_strategy) == "channel"
+            and not getattr(qkv_scheme, "is_static_input_scheme", True)
+            and hasattr(self.self_attn.qkv_proj, "weight_scale")
+            and getattr(self.self_attn.qkv_proj, "input_scale", None) is None
+        )
 
         moe_layer_freq = getattr(config, "moe_layer_freq", None)
         # Means "MLP is a sparse MoE", not attention sparsity. Kept as ``is_layer_sparse``
@@ -1551,6 +1581,25 @@ class MiniMaxM3DecoderLayer(nn.Module):
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
         )
+        if layer_id == 0 and self.use_lightop_gemma_rmsnorm_fp8_quant:
+            log_info_on_rank0(
+                logger,
+                "MiniMax LightOp Gemma RMSNorm + per-token FP8 quant enabled "
+                "for attention projections.",
+            )
+        elif layer_id == 0 and _use_lightop_gemma_rmsnorm_fp8_quant:
+            log_info_on_rank0(
+                logger,
+                "MiniMax LightOp Gemma RMSNorm + FP8 quant was requested but "
+                "the QKV projection is not dynamic channel-wise FP8; keeping "
+                "the existing RMSNorm path.",
+            )
+        if layer_id == 0 and _use_minimax_aiter_fused_ar_rmsnorm:
+            log_info_on_rank0(
+                logger,
+                "MiniMax AITER cross-layer all-reduce + residual + RMSNorm "
+                "requested; runtime layout gates remain active.",
+            )
 
     def forward(
         self,
@@ -1561,17 +1610,26 @@ class MiniMaxM3DecoderLayer(nn.Module):
         captured_last_layer_outputs: Optional[List[torch.Tensor]] = None,
         **kwargs,
     ) -> torch.Tensor:
+        quant_format = (
+            "lightop_fp8_per_token"
+            if self.use_lightop_gemma_rmsnorm_fp8_quant
+            else ""
+        )
         hidden_states, residual = (
             self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
                 hidden_states,
                 residual,
                 forward_batch,
                 captured_last_layer_outputs=captured_last_layer_outputs,
+                quant_format=quant_format,
                 **kwargs,
             )
         )
 
-        if hidden_states.shape[0] != 0:
+        attn_input = (
+            hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        )
+        if attn_input.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1582,19 +1640,26 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
             )
         )
-        if self.is_layer_sparse and get_parallel().tp_size > 1:
-            # Sparse MoE outputs are TP-partial; deferring their all-reduce into the next
-            # layer's fusion re-triggers the M3 no-EOS runaway. Force immediate all-reduce.
-            should_allreduce_fusion = False
-
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
+        if self.is_layer_sparse:
+            # AITER can fuse only one reduction group and cannot also perform
+            # the DP/CP layout conversion normally owned by postprocess_layer.
+            # Standard EP uses a global-TP reduction for MiniMax shared-expert
+            # semantics, whereas this cross-layer path deliberately targets a
+            # single MoE-TP group.
+            should_allreduce_fusion = should_allreduce_fusion and (
+                _use_minimax_aiter_fused_ar_rmsnorm
+                and not use_reduce_scatter
+                and not self.mlp.reduce_over_global_tp
+                and self.mlp.tp_size > 1
+            )
 
         if self.is_layer_sparse or hidden_states.shape[0] != 0:
             hidden_states = self.mlp(
