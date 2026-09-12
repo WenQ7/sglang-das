@@ -607,7 +607,16 @@ class MiniMaxM3MoE(nn.Module):
 
     def _forward_router_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         router_logits = self._compute_router_logits(hidden_states)
-        topk_output = self.topk(hidden_states, router_logits)
+        # Expert weights are loaded into the physical slots selected by EPLB.
+        # Apply the same logical-to-physical mapping on standard EP dispatch;
+        # otherwise non-trivial placement routes tokens to the wrong weights.
+        topk_output = self.topk(
+            hidden_states,
+            router_logits,
+            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
+                layer_id=self.layer_id,
+            ),
+        )
         return self.experts(hidden_states, topk_output)
 
     def forward_deepep(
