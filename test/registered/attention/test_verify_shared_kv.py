@@ -7,7 +7,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
-from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
+from sglang.kernels.ops.attention.verify_mla import block_config, verify_shared_kv_fwd
 from sglang.srt.layers.attention.triton_backend import (
     _should_use_verify_shared_kv,
 )
@@ -58,6 +58,10 @@ def _build_inputs(
 
 @unittest.skipIf(not torch.cuda.is_available(), "GPU required")
 class TestVerifySharedKV(CustomTestCase):
+    def test_minimax_m3_gqa16_uses_full_group_tile(self):
+        self.assertEqual(block_config(128, 16), (16, 64, 4))
+        self.assertEqual(block_config(128, 8), (4, 64, 8))
+
     def _run_parity(
         self,
         head_dim,

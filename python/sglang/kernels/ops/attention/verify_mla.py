@@ -34,11 +34,23 @@ _BLOCK_CONFIG = {
 }
 
 
-def block_config(head_dim):
+def block_config(head_dim, kv_group_num=None):
     """
     Return (BLOCK_H, BLOCK_N, num_warps) for a head_dim; default for untuned
     dims. BLOCK_H must be a power of 2 (heads beyond H_Q are masked).
     """
+    # MiniMax-M3 exposes 64 Q heads and 4 KV heads on the attention-DP8
+    # winner, i.e. 16 Q heads share one KV head.  Keeping that complete GQA
+    # group in one program reuses every K/V tile across all 16 heads.  On the
+    # real c32/DP8/128K shape this changes stage-1 from about 7.6 ms to
+    # 1.36 ms on gfx938.  Four warps are faster than eight for both DSpark's
+    # two-token verify and EAGLE's four-token verify because the complete
+    # 16-head tile already exposes enough dot-product work.  Gate on the GQA
+    # group as well as head_dim so a
+    # different 128-d model with a smaller group retains the conservative
+    # default instead of losing the fast path.
+    if head_dim == 128 and kv_group_num == 16:
+        return (16, 64, 4)
     return _BLOCK_CONFIG.get(
         head_dim, (DEFAULT_BLOCK_H, DEFAULT_BLOCK_N, DEFAULT_NUM_WARPS)
     )
@@ -410,7 +422,17 @@ class VerifyMLA:
             self._alloc(max_bs)
 
     def _num_splits(self, bs):
-        budget = TARGET_PROGRAMS // max(1, bs * self.n_head_blocks)
+        # With MiniMax-M3's full 16-head GQA tile, 128 programs produce the
+        # same eight prefix splits as the previous BLOCK_H=4/512-program
+        # configuration at local bs=4.  Besides avoiding needless partial
+        # buffers, preserving the split boundaries makes the optimized kernel
+        # bit-exact with the previous reduction order on the c32 winner.
+        target_programs = (
+            128
+            if self.head_dim == 128 and self.kv_group_num == 16
+            else TARGET_PROGRAMS
+        )
+        budget = target_programs // max(1, bs * self.n_head_blocks)
         return max(1, min(MAX_N_SPLITS, budget))
 
     def _run_prefix_kernel(
@@ -578,7 +600,7 @@ def _get_vmla(max_bs, h_q, h_kv, head_dim, v_head_dim, l_ext, device):
     key = (h_q, h_kv, head_dim, v_head_dim, l_ext, str(device))
     vk = _VMLA_CACHE.get(key)
     if vk is None:
-        block_h, block_n, num_warps = block_config(head_dim)
+        block_h, block_n, num_warps = block_config(head_dim, h_q // h_kv)
         vk = VerifyMLA(
             max_bs,
             h_q,
@@ -742,8 +764,8 @@ def verify_shared_kv_fwd(
     head_dim = q_extend.shape[2]
     v_head_dim = v_extend.shape[2]
     l_ext = int(max_len_extend)
-    block_h, _, _ = block_config(head_dim)
     kv_group_num = h_q // h_kv
+    block_h, _, _ = block_config(head_dim, kv_group_num)
     if block_h > kv_group_num or kv_group_num % block_h != 0:
         return False
 
