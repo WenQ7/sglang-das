@@ -2076,6 +2076,22 @@ def get_moe_ep_group() -> GroupCoordinator:
     return _MOE_EP
 
 
+def should_reuse_tp_group_for_full_moe_ep(
+    moe_ep_size: int, tensor_model_parallel_size: int
+) -> bool:
+    """Whether full-stage MoE EP may alias the TP process group.
+
+    DeepEP communicator isolation deliberately creates another process group
+    with the same rank membership.  Keeping this decision in one helper makes
+    the otherwise subtle full-EP aliasing behavior regression-testable.
+    """
+    return (
+        moe_ep_size == tensor_model_parallel_size
+        and not _is_npu
+        and not envs.SGLANG_DEEPEP_USE_MOE_EP_GROUP.get()
+    )
+
+
 def get_moe_tp_group() -> GroupCoordinator:
     assert _MOE_TP is not None, "expert model parallel group is not initialized"
     return _MOE_TP
@@ -2657,8 +2673,15 @@ def initialize_model_parallel(
 
     global _MOE_EP
     assert _MOE_EP is None, "expert model parallel group is already initialized"
-    # NPU requires a standalone group for MOE expert parallelism
-    if moe_ep_size == tensor_model_parallel_size and not _is_npu:
+    # NPU requires a standalone group for MOE expert parallelism.  DeepEP can
+    # request the same isolation on GPU: full EP otherwise aliases _TP, which
+    # makes DeepEP and context-parallel collectives share one ordering domain.
+    # CP implementations may enqueue collectives from auxiliary streams, so an
+    # independent group is required to prevent a large CP gather from being
+    # ordered against a DeepEP dispatch/bootstrap collective.
+    if should_reuse_tp_group_for_full_moe_ep(
+        moe_ep_size, tensor_model_parallel_size
+    ):
         _MOE_EP = _TP
     else:
         group_ranks = []

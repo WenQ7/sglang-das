@@ -125,6 +125,13 @@ def _maybe_copy_weight_view_before_h2d(
 def _get_deepep_comm_group(a2a_backend):
     group = get_tp_group().device_group
 
+    if envs.SGLANG_DEEPEP_USE_MOE_EP_GROUP.get():
+        group = get_moe_ep_group().device_group
+        print_info_once(
+            "DeepEP communicator: using the standalone MoE-EP process group "
+            "(SGLANG_DEEPEP_USE_MOE_EP_GROUP=1)."
+        )
+
     if a2a_backend.is_mori():
         group = get_tp_group()
 
@@ -163,7 +170,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
             deepep_mode=get_deepep_mode(),
-            async_finish=True,
+            async_finish=envs.SGLANG_DEEPEP_ASYNC_FINISH.get(),
             return_recv_hook=True,
         )
     elif a2a_backend.is_flashinfer():
