@@ -102,6 +102,36 @@ class ZigzagContextParallelMetadata(BaseContextParallelMetadata):
 ContextParallelMetadata = ZigzagContextParallelMetadata
 
 
+def compute_zigzag_cp_physical_token_count(
+    extend_seq_lens: List[int], cp_size: int
+) -> int:
+    """Return the padded row count held by one zigzag-CP rank.
+
+    The scheduler needs this value before ``ForwardBatch`` construction so it
+    can publish CP-local DP-attention buffer sizes to every DP replica.  Keep
+    the arithmetic here in lockstep with ``build_metadata`` and
+    ``pad_logical_token_to_physical`` without allocating any device tensors.
+    """
+    if cp_size <= 1:
+        return sum(int(length) for length in extend_seq_lens)
+
+    cp_segment_num = cp_size * 2
+    per_rank_tokens = [0] * cp_size
+    for raw_length in extend_seq_lens:
+        length = int(raw_length)
+        base, rem = divmod(length, cp_segment_num)
+        for rank in range(cp_size):
+            per_rank_tokens[rank] += (
+                2 * base
+                + int(rank < rem)
+                + int(cp_segment_num - 1 - rank < rem)
+            )
+
+    # Zigzag padding aligns the largest logical shard to 2 * cp_size.
+    max_tokens = max(per_rank_tokens, default=0)
+    return (max_tokens + cp_segment_num - 1) // cp_segment_num * cp_segment_num
+
+
 class ZigzagCPStrategy(ContextParallelStrategy):
     name = "zigzag"
     kind = ContextParallelStrategyKind.ZIGZAG

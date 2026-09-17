@@ -512,6 +512,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
+    global_cp_num_tokens_cpu: Optional[List[int]] = None
 
     # For padding
     num_token_non_padded: Optional[torch.Tensor] = None  # scalar tensor
@@ -547,6 +548,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # this will be recomputed in LogitsMetadata.from_forward_batch
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
+    # CP-v2 expands the DP buffer into one slot per (attention-DP, CP) shard.
+    dp_local_token_index: Optional[int] = None
+    cp_local_dp_layout: bool = False
     global_dp_buffer_len: Optional[int] = None
 
     # For Qwen2-VL
@@ -698,6 +702,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.global_num_tokens_for_logprob_gpu = torch.tensor(
             global_num_tokens_for_logprob, dtype=torch.int64
         ).to(device, non_blocking=True)
+        self.global_cp_num_tokens_cpu = batch.global_cp_num_tokens
         self.can_run_dp_cuda_graph = batch.can_run_dp_cuda_graph
 
     @classmethod

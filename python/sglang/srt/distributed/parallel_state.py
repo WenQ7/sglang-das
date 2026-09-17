@@ -1965,6 +1965,7 @@ def init_model_parallel_group(
 _TP: Optional[GroupCoordinator] = None
 _ATTN_TP: Optional[GroupCoordinator] = None
 _ATTN_CP: Optional[GroupCoordinator] = None
+_ATTN_DP_TP: Optional[GroupCoordinator] = None
 _ATTN_CP_OVERLAP: Optional[GroupCoordinator] = None
 _DCP: Optional[GroupCoordinator] = None
 
@@ -2001,6 +2002,12 @@ def get_attn_cp_group() -> GroupCoordinator:
         _ATTN_CP is not None
     ), "attention context model parallel group is not initialized"
     return _ATTN_CP
+
+
+def get_attn_dp_tp_group() -> GroupCoordinator:
+    """Return ranks sharing a CP index across attention DP and attention TP."""
+    assert _ATTN_DP_TP is not None, "attention DP-TP group is not initialized"
+    return _ATTN_DP_TP
 
 
 def get_attn_cp_overlap_group() -> GroupCoordinator:
@@ -2638,6 +2645,36 @@ def initialize_model_parallel(
             max_world_size=max_world_size,
         )
 
+    # CP-v2 DP gather: for each CP index, span all attention-DP replicas and
+    # their attention-TP ranks, while excluding the other CP token shards.
+    global _ATTN_DP_TP
+    assert _ATTN_DP_TP is None, "attention DP-TP group is already initialized"
+    if attn_cp_size == 1:
+        _ATTN_DP_TP = _TP
+    else:
+        group_ranks = []
+        for tp_group_idx in range(num_tensor_model_parallel_groups):
+            tp_base = tp_group_idx * tensor_model_parallel_size
+            for cp_idx in range(attn_cp_size):
+                ranks = []
+                for dp_idx in range(attn_dp_size):
+                    start = (
+                        tp_base
+                        + (dp_idx * attn_cp_size + cp_idx) * attn_tp_size
+                    )
+                    ranks.extend(range(start, start + attn_tp_size))
+                group_ranks.append(ranks)
+        _ATTN_DP_TP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_custom_allreduce=False,
+            group_name="attention_dp_tp",
+            recovered_rank=recovered_rank,
+            rank_offset=rank_offset,
+            max_world_size=max_world_size,
+        )
+
     moe_ep_size = expert_model_parallel_size
     moe_dp_size = moe_data_model_parallel_size
     moe_tp_size = tensor_model_parallel_size // moe_ep_size // moe_dp_size
@@ -3024,6 +3061,10 @@ def destroy_model_parallel():
     _ATTN_CP = None
 
     global _ATTN_TP
+    global _ATTN_DP_TP
+    if _ATTN_DP_TP and _ATTN_DP_TP is not _TP:
+        _ATTN_DP_TP.destroy()
+    _ATTN_DP_TP = None
     if _ATTN_TP:
         _ATTN_TP.destroy()
     _ATTN_TP = None
