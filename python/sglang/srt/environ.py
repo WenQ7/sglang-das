@@ -1451,6 +1451,10 @@ class Envs:
     # decode-graph capture, issue that TP-sharded branch on a HIP side stream
     # while router + routed experts stay on the main stream.
     SGLANG_OPT_USE_MINIMAX_STANDARD_EP_SHARED_EXPERT_OVERLAP = EnvBool(False)
+    # DeepEP uses a replicated TP1 shared expert. Allow that independent branch
+    # to overlap router + routed A2A/GEMMs during long prefill. Keep this
+    # opt-in because small decode batches can lose from CU contention.
+    SGLANG_OPT_USE_MINIMAX_DEEPEP_SHARED_EXPERT_OVERLAP = EnvBool(False)
     # Backward-compatible FP8-specific spelling for the following generic gate.
     SGLANG_OPT_USE_EAGLE3_FP8_LM_HEAD_TOP1 = EnvBool(False)
     # EAGLE3-only greedy draft path: reduce Top-1 immediately after each

@@ -509,13 +509,25 @@ class MiniMaxM3MoE(nn.Module):
             and self.num_fused_shared_experts == 0
             and self.alt_stream is not None
         )
-        if self.enable_standard_ep_shared_expert_overlap and layer_id == 0:
-            log_info_on_rank0(
-                logger,
+        if self.enable_standard_ep_shared_expert_overlap:
+            logger.info_once(
                 "MiniMax standard-EP TP-sharded shared-expert overlap enabled "
                 f"(HIP, EP={parallel.moe_ep_size}, full decode graph capture).",
             )
-
+        self.enable_deepep_shared_expert_overlap = (
+            _is_hip
+            and envs.SGLANG_OPT_USE_MINIMAX_DEEPEP_SHARED_EXPERT_OVERLAP.get()
+            and get_moe_a2a_backend().is_deepep()
+            and parallel.moe_ep_size > 1
+            and self.shared_experts is not None
+            and self.num_fused_shared_experts == 0
+            and self.alt_stream is not None
+        )
+        if self.enable_deepep_shared_expert_overlap:
+            logger.info_once(
+                "MiniMax DeepEP replicated shared-expert overlap enabled "
+                f"(HIP, EP={parallel.moe_ep_size}).",
+            )
         self.bf16_router_gemm = envs.SGLANG_OPT_USE_BF16_ROUTER_GEMM.get()
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -629,14 +641,20 @@ class MiniMaxM3MoE(nn.Module):
             or forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_decode()
         )
+        current_stream = None
         if hidden_states.shape[0] > 0:
+            if self.enable_deepep_shared_expert_overlap:
+                current_stream = torch.cuda.current_stream()
+                self.alt_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    shared_output = self._forward_shared_experts(hidden_states)
             router_logits = self._compute_router_logits(hidden_states)
             if enable_npu_dual_stream:
                 # Overlap shared experts with router/experts on a separate stream.
                 shared_output = process_shared_expert(
                     hidden_states, self._forward_shared_experts
                 )
-            else:
+            elif not self.enable_deepep_shared_expert_overlap:
                 shared_output = self._forward_shared_experts(hidden_states)
             topk_output = self.topk(
                 hidden_states,
@@ -655,6 +673,9 @@ class MiniMaxM3MoE(nn.Module):
 
         if enable_npu_dual_stream:
             wait_share_stream()
+        elif self.enable_deepep_shared_expert_overlap and hidden_states.shape[0] > 0:
+            assert current_stream is not None
+            current_stream.wait_stream(self.alt_stream)
 
         if shared_output is not None:
             final_hidden_states = final_hidden_states + shared_output
@@ -1849,13 +1870,13 @@ class MiniMaxM3Model(nn.Module):
 
         if _is_cuda:
             alt_stream = get_stream("alt")
-        elif (
-            _is_hip
-            and envs.SGLANG_OPT_USE_MINIMAX_STANDARD_EP_SHARED_EXPERT_OVERLAP.get()
+        elif _is_hip and (
+            envs.SGLANG_OPT_USE_MINIMAX_STANDARD_EP_SHARED_EXPERT_OVERLAP.get()
+            or envs.SGLANG_OPT_USE_MINIMAX_DEEPEP_SHARED_EXPERT_OVERLAP.get()
         ):
             # A dedicated name avoids coupling the MoE graph dependencies to
             # unrelated cache/attention users of the legacy "alt" stream.
-            alt_stream = get_stream("minimax_m3_standard_ep_shared")
+            alt_stream = get_stream("minimax_m3_ep_shared")
         else:
             alt_stream = None
 
