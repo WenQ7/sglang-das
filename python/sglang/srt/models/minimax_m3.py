@@ -2110,6 +2110,29 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             if 0 <= layer_id < len(self.model.layers):
                 setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
 
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        """Configure MiniMax target hidden states consumed by DSpark.
+
+        DSpark layer ids name zero-based target layer outputs.  MiniMax records
+        an auxiliary hidden state at the following layer entry, hence the +1.
+        """
+        if self.pp_group.world_size > 1:
+            raise NotImplementedError(
+                "MiniMax-M3 DSPARK aux hidden capture requires PP=1."
+            )
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        for layer_id in self.model.layers_to_capture:
+            if 0 <= layer_id < len(self.model.layers):
+                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
+
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
 

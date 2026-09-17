@@ -213,6 +213,27 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             if 0 <= layer_id < len(self.model.layers):
                 setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
 
+    def set_dspark_layers_to_capture(self, layer_ids: list[int]) -> None:
+        """Configure text-model hidden-state snapshots consumed by DSpark."""
+        if self.pp_group.world_size > 1:
+            raise NotImplementedError(
+                "MiniMax-M3 DSPARK aux hidden capture requires PP=1."
+            )
+        if not self.pp_group.is_last_rank:
+            return
+        if layer_ids is None:
+            raise ValueError(
+                "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+
+        self.capture_aux_hidden_states = True
+        # DSpark names HF-style target layer outputs; MiniMax captures the same
+        # tensor at the following decoder-layer entry.
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
+        for layer_id in self.model.layers_to_capture:
+            if 0 <= layer_id < len(self.model.layers):
+                setattr(self.model.layers[layer_id], "_is_layer_to_capture", True)
+
     def forward(
         self,
         input_ids: torch.Tensor,
