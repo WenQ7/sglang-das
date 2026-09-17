@@ -1987,6 +1987,33 @@ class MiniMaxM3Model(nn.Module):
                             else None
                         ),
                     )
+                    if (
+                        os.environ.get("SGLANG_MINIMAX_BATCH_PROBE", "0") == "1"
+                        and forward_batch.attn_cp_metadata is not None
+                        and get_parallel().attn_cp_rank == 0
+                    ):
+                        meta = forward_batch.attn_cp_metadata
+                        prev_lens = meta.actual_seq_q_prev_list or []
+                        next_lens = meta.actual_seq_q_next_list or []
+                        if len(prev_lens) == len(next_lens) == meta.bs:
+                            next_base = int(meta.total_q_prev_tokens)
+                            next_offset = 0
+                            for request_index, next_len in enumerate(next_lens):
+                                if next_len:
+                                    row = hidden_states[
+                                        next_base + next_offset + int(next_len) - 1
+                                    ].float()
+                                    logger.info(
+                                        "[MiniMaxBatchProbe] layer=%d bs=%d req=%d "
+                                        "last64_sum=%.9g last64_abs=%.9g rms=%.9g",
+                                        i,
+                                        meta.bs,
+                                        request_index,
+                                        row[:64].sum().item(),
+                                        row[:64].abs().sum().item(),
+                                        row.square().mean().sqrt().item(),
+                                    )
+                                next_offset += int(next_len)
 
         if not self.pp_group.is_last_rank:
             return PPProxyTensors(
