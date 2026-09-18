@@ -1933,21 +1933,27 @@ def _post_process_topk_ids(
     )
     capture_routed_experts_if_allowed(topk_config, layer_id, topk_ids)
     recorder_topk_ids = None
+    log2phy_prob = None
+    dispatch_algorithm = (
+        getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
+        if expert_location_dispatch_info is not None
+        else None
+    )
+    if (
+        dispatch_algorithm in ("lp", "load_aware")
+    ):
+        from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
+
+        lplb_solver = get_global_lplb_solver(layer_id)
+        if lplb_solver is not None:
+            log2phy_prob = (
+                lplb_solver.solve(topk_ids, num_token_non_padded)
+                if dispatch_algorithm == "load_aware"
+                else lplb_solver.solve(topk_ids)
+            )
     if _is_cuda:
         # LP path: solve LP outside torch.compile (the solver contains an
         # EP all-reduce that can't run inside compiled regions).
-        log2phy_prob = None
-        if (
-            expert_location_dispatch_info is not None
-            and getattr(expert_location_dispatch_info, "ep_dispatch_algorithm", None)
-            == "lp"
-        ):
-            from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
-
-            lplb_solver = get_global_lplb_solver(layer_id)
-            if lplb_solver is not None:
-                log2phy_prob = lplb_solver.solve(topk_ids)
-
         if log2phy_prob is not None:
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info, log2phy_prob
@@ -1985,7 +1991,7 @@ def _post_process_topk_ids(
         # the map is identity so the remap can be skipped safely.
         if _eplb_remap_enabled():
             topk_ids = topk_ids_logical_to_physical(
-                topk_ids, expert_location_dispatch_info
+                topk_ids, expert_location_dispatch_info, log2phy_prob
             )
         # NOTE (HIP): padded-token routing-weight zeroing is deferred to the
         # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).

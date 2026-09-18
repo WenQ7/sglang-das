@@ -697,7 +697,10 @@ class ModelRunner:
         )
 
     def maybe_init_lplb_solvers(self):
-        if get_exec().moe.ep_dispatch_algorithm == "lp" and not self.is_draft_worker:
+        if get_exec().moe.ep_dispatch_algorithm in (
+            "lp",
+            "load_aware",
+        ) and not self.is_draft_worker:
             init_lplb_solvers(model_config=self.model_config)
 
     def maybe_init_eplb_manager(self):
