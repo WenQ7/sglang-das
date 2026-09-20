@@ -469,6 +469,9 @@ class Envs:
     SGLANG_SIMULATE_ACC_TOKEN_MODE = EnvStr("fixed")
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
+    # DeepEP accepts topk_idx=-1 as "no expert selected" in both normal and
+    # low-latency dispatch. Use it to remove zero-weight graph-padding work.
+    SGLANG_MINIMAX_DROP_PADDED_DEEPEP_TOKENS = EnvBool(False)
 
     # ===================================================================
     # DSpark speculative decoding

@@ -1978,21 +1978,48 @@ def _post_process_topk_ids(
                 topk_ids, expert_location_dispatch_info, num_token_non_padded
             )
     elif _is_hip:
-        # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely
-        # (negative indices cause illegal memory access). Always fill the padded
-        # region with 0 so every kernel sees a valid in-range expert id.
+        # On AMD HIP direct aiter MoE kernels do not handle topk_ids=-1 safely
+        # (negative indices cause illegal memory access), so the default fills
+        # padding with a valid in-range ID. DeepEP is the exception: its public
+        # dispatch/combine API explicitly supports -1 as "no selection".
         # Routing weights for padded tokens are zeroed below so their
         # contribution to the hidden state is still zero regardless of the id.
         # Regression: skipping this mask when EPLB is disabled caused garbage
         # MoE routing for models like DeepSeek-R1-MXFP4 (accuracy ~0.09 vs 0.94+).
-        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
+        has_padded_rows = num_token_non_padded is not None
+        eplb_remap_enabled = _eplb_remap_enabled()
+        drop_padded_deepep = (
+            envs.SGLANG_MINIMAX_DROP_PADDED_DEEPEP_TOKENS.get()
+            and has_padded_rows
+            and get_exec().moe.moe_a2a_backend == "deepep"
+        )
+        if drop_padded_deepep:
+            # DeepEP documents -1 as "no expert selected" for normal and
+            # low-latency dispatch/combine. Unlike direct HIP MoE kernels,
+            # DeepGEMM only consumes the post-dispatch expert buffers and never
+            # sees these IDs, so padded rows can be removed before communication
+            # and expert compute without changing valid-token numerics.
+            # A logical->physical lookup cannot consume -1, so mapped layouts
+            # temporarily use expert 0 and restore the DeepEP sentinel after
+            # the lookup below. Identity placement can write -1 immediately.
+            _mask_topk_ids_padded_region(
+                topk_ids,
+                num_token_non_padded,
+                fill_value=0 if eplb_remap_enabled else -1,
+            )
+        else:
+            _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         # The logical->physical remap is only meaningful when a real
         # expert-location mapping exists. With a trivial placement and EPLB off
         # the map is identity so the remap can be skipped safely.
-        if _eplb_remap_enabled():
+        if eplb_remap_enabled:
             topk_ids = topk_ids_logical_to_physical(
                 topk_ids, expert_location_dispatch_info, log2phy_prob
             )
+            if drop_padded_deepep:
+                _mask_topk_ids_padded_region(
+                    topk_ids, num_token_non_padded, fill_value=-1
+                )
         # NOTE (HIP): padded-token routing-weight zeroing is deferred to the
         # single pass at the end of this function (gated by SGLANG_MORI_NO_PAD_MASK).
         # That final pass re-zeros after any shared-expert append/remap, so a
