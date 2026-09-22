@@ -1,11 +1,16 @@
 import json
 import tempfile
 import unittest
+from types import SimpleNamespace
 
 from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
     AdaptiveStepSlot,
     resolve_candidate_steps_from_config,
+)
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+    SpecRuntimeState,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 
@@ -390,6 +395,85 @@ class TestBatchSizeRouting(unittest.TestCase):
             params.on_verify_complete([7, 7, 7], batch_size=1)
         self.assertGreater(params.get_steps_for_batch(1), 1)
         self.assertEqual(params.get_steps_for_batch(32), 1)
+
+
+class _FakeAdaptiveWorker:
+    def __init__(self, steps=3):
+        self.speculative_num_steps = steps
+        self.applied_steps = []
+
+    def build_adaptive_runtime_state(
+        self, speculative_num_steps, speculative_num_draft_tokens, cuda_graph_bs=None
+    ):
+        return SpecRuntimeState(
+            speculative_num_steps=speculative_num_steps,
+            speculative_num_draft_tokens=speculative_num_draft_tokens,
+            draft_attn_backend=None,
+            cuda_graph_runner=None,
+            target_attn_backend=SimpleNamespace(),
+            target_graph_runner=None,
+            draft_extend_attn_backend=None,
+            cuda_graph_runner_for_draft_extend=None,
+        )
+
+    def apply_runtime_state(self, state):
+        self.speculative_num_steps = state.speculative_num_steps
+        self.applied_steps.append(state.speculative_num_steps)
+
+
+class TestAdaptiveExecutionGroupSynchronization(unittest.TestCase):
+    def test_synchronized_acceptance_drives_one_common_transition(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "1": {
+                        "candidate_steps": [1, 3],
+                        "ema_alpha": 1.0,
+                        "warmup_batches": 0,
+                        "update_interval": 1,
+                    }
+                },
+                f,
+            )
+            f.flush()
+            worker = _FakeAdaptiveWorker(steps=3)
+            calls = []
+
+            def synchronize(local_acceptance, local_batch_size):
+                calls.append((local_acceptance, local_batch_size))
+                return [0.0], 8
+
+            controller = AdaptiveController(
+                worker, f.name, stats_synchronizer=synchronize
+            )
+            controller.init_states()
+            controller.on_verify_complete([3, 3], batch_size=2)
+
+        self.assertEqual(calls, [([3, 3], 2)])
+        self.assertEqual(worker.speculative_num_steps, 1)
+        self.assertEqual(controller._last_synchronized_batch_size, 8)
+
+    def test_routing_reuses_synchronized_batch_size(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(
+                {
+                    "1": {"candidate_steps": [1]},
+                    "8": {"candidate_steps": [3]},
+                },
+                f,
+            )
+            f.flush()
+            worker = _FakeAdaptiveWorker(steps=3)
+            controller = AdaptiveController(
+                worker,
+                f.name,
+                stats_synchronizer=lambda _accept, _bs: ([3.0], 8),
+            )
+            controller.init_states()
+            controller.on_verify_complete([3], batch_size=1)
+            controller.activate_step_by_batch(batch_size=1)
+
+        self.assertEqual(worker.speculative_num_steps, 3)
 
 
 class TestResolveCandidateSteps(unittest.TestCase):

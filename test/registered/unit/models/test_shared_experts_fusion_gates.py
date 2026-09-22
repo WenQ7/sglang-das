@@ -252,6 +252,39 @@ class TestMiniMaxGates(_FusionGateCase):
         )
         self.assertIn("keep it TP-sharded", reason)
 
+    def test_enforce_allows_deepep_ep8_per_rank_shared_slots(self):
+        from sglang.srt.layers.moe.utils import MoeA2ABackend
+        from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
+
+        self._seed(enforce_shared_experts_fusion=True)
+        with unittest.mock.patch(
+            "sglang.srt.models.minimax_m3.get_moe_a2a_backend",
+            return_value=MoeA2ABackend.DEEPEP,
+        ):
+            self.assertIsNone(
+                self._reason(
+                    MiniMaxM3SparseForCausalLM,
+                    SimpleNamespace(n_shared_experts=1),
+                    _quant("w8a8_fp8"),
+                    moe_ep_size=8,
+                )
+            )
+
+    def test_deepep_ep8_r8_allocates_eighteen_local_slots(self):
+        from sglang.srt.models.minimax_m3 import (
+            _minimax_moe_num_physical_experts,
+        )
+
+        num_experts = _minimax_moe_num_physical_experts(
+            num_routed_experts=128,
+            num_fused_shared_experts=1,
+            ep_size=8,
+            num_redundant_experts=8,
+            use_per_rank_shared_slots=True,
+        )
+        self.assertEqual(num_experts, 144)
+        self.assertEqual(num_experts // 8, 18)
+
     def test_enforce_rejects_multiple_shared_experts(self):
         from sglang.srt.models.minimax_m3 import MiniMaxM3SparseForCausalLM
 

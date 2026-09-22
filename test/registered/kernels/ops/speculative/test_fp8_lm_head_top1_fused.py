@@ -40,19 +40,23 @@ class TestFp8LmHeadTop1Fused(unittest.TestCase):
 
     def test_bf16_matches_materialized_logits_exactly(self):
         torch.manual_seed(17)
-        m, n, k = 8, 513, 256
-        hidden = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+        n, k = 513, 256
         weight = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.01
 
-        expected_values, expected_ids = draft_topk1_argmax(
-            hidden @ weight.T
-        )
-        actual_values, actual_ids = bf16_lm_head_top1_fused(
-            hidden, weight, valid_vocab_size=n
-        )
+        # M=16 is the current target-verify winner shape (local BS4 * width4),
+        # while M=32 guards the multi-program M grid for larger batches.
+        for m in (1, 8, 16, 32):
+            with self.subTest(m=m):
+                hidden = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
+                expected_values, expected_ids = draft_topk1_argmax(
+                    hidden @ weight.T
+                )
+                actual_values, actual_ids = bf16_lm_head_top1_fused(
+                    hidden, weight, valid_vocab_size=n
+                )
 
-        self.assertTrue(torch.equal(actual_ids, expected_ids))
-        self.assertTrue(torch.equal(actual_values, expected_values))
+                self.assertTrue(torch.equal(actual_ids, expected_ids))
+                self.assertTrue(torch.equal(actual_values, expected_values))
 
     def test_excludes_padding_rows(self):
         m, valid_n, padded_n, k = 2, 257, 384, 256
@@ -82,15 +86,20 @@ class TestFp8LmHeadTop1Fused(unittest.TestCase):
 
         self.assertEqual(actual.item(), 0)
 
-    def test_rejects_non_draft_batch(self):
-        hidden = torch.zeros((9, 256), device="cuda", dtype=torch.bfloat16)
-        weight = torch.zeros((128, 256), device="cuda", dtype=torch.bfloat16)
+    def test_supports_gathered_target_batch(self):
+        torch.manual_seed(20260920)
+        hidden = torch.randn((32, 256), device="cuda", dtype=torch.bfloat16)
+        weight = torch.randn((513, 256), device="cuda", dtype=torch.bfloat16) * 0.01
+        winners = torch.arange(32, device="cuda", dtype=torch.int64)
+        for row, winner in enumerate(winners.tolist()):
+            weight[winner].copy_(hidden[row] * 8)
         qweight, scales = quantize_lm_head_weight_fp8_per_channel(weight)
 
-        with self.assertRaisesRegex(ValueError, "M <= 8"):
-            fp8_lm_head_top1_fused(
-                hidden, qweight, scales, valid_vocab_size=128
-            )
+        _, actual_ids = fp8_lm_head_top1_fused(
+            hidden, qweight, scales, valid_vocab_size=513
+        )
+
+        self.assertTrue(torch.equal(actual_ids.long(), winners))
 
     def test_hip_graph_replay_uses_new_input(self):
         torch.manual_seed(11)
