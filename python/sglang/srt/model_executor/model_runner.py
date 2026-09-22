@@ -1126,14 +1126,22 @@ class ModelRunner:
             pyt_hooks = PytHooks()
             pyt_hooks.register_hooks(self.model, module_prefix="model")
 
-        # Same leaf `configure_kv_cache_dtype` reads: the bag, not the startup
-        # record, so the FP8 gate and the pool cannot disagree after an
-        # override. (The runner's own stamp is not set yet -- load_model runs
-        # before configure_kv_cache_dtype.)
+        # load_model runs before configure_kv_cache_dtype(), so resolve the
+        # draft override explicitly here.  Reading only the process-global
+        # target dtype makes a BF16 EAGLE draft look like an unscaled FP8 model
+        # and emits a false scale=1.0 warning.
+        scale_kv_cache_dtype = get_model().kv_cache_dtype
+        if (
+            self.is_draft_worker
+            and self.server_args.speculative_draft_kv_cache_dtype is not None
+        ):
+            scale_kv_cache_dtype = (
+                self.server_args.speculative_draft_kv_cache_dtype
+            )
         load_kv_cache_scales(
             model=self.model,
             server_args=self.server_args,
-            kv_cache_dtype=get_model().kv_cache_dtype,
+            kv_cache_dtype=scale_kv_cache_dtype,
         )
 
         self.sliding_window_size = resolve_sliding_window_size(

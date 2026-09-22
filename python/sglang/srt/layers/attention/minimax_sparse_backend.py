@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
     get_minimax_sparse_score_type,
+    minimax_sparse_layer_skips_topk,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
@@ -56,6 +58,71 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 _minimax_sparse_cp_logged = False
+
+
+def _compute_verify_topk_overlap_metrics(
+    topk_idx: torch.Tensor,
+    batch_size: int,
+    verify_width: int,
+) -> torch.Tensor:
+    """Return per-request [union, expansion, pair recall, pair Jaccard]."""
+    num_heads, rows, topk = topk_idx.shape
+    expected_rows = int(batch_size) * int(verify_width)
+    if rows != expected_rows:
+        raise ValueError(
+            "MiniMax verify TopK expected request-major rows: "
+            f"rows={rows}, batch={batch_size}, width={verify_width}"
+        )
+    grouped = topk_idx.view(num_heads, batch_size, verify_width, topk)
+    valid = grouped.ge(0)
+    per_query_count = valid.sum(dim=-1).to(torch.float32)
+
+    flattened = grouped.reshape(num_heads, batch_size, verify_width * topk)
+    sorted_ids = flattened.sort(dim=-1).values
+    sorted_valid = sorted_ids.ge(0)
+    is_unique = sorted_valid.clone()
+    if sorted_ids.shape[-1] > 1:
+        is_unique[..., 1:] &= sorted_ids[..., 1:].ne(sorted_ids[..., :-1])
+    union_size = is_unique.sum(dim=-1).to(torch.float32)
+    mean_set_size = per_query_count.mean(dim=-1).clamp_min(1.0)
+    union_expansion = union_size / mean_set_size
+
+    pair_recalls = []
+    pair_jaccards = []
+    for lhs_q in range(verify_width):
+        lhs = grouped[:, :, lhs_q, :]
+        lhs_valid = valid[:, :, lhs_q, :]
+        lhs_count = per_query_count[:, :, lhs_q]
+        for rhs_q in range(lhs_q + 1, verify_width):
+            rhs = grouped[:, :, rhs_q, :]
+            rhs_count = per_query_count[:, :, rhs_q]
+            intersection = (
+                lhs_valid & lhs.unsqueeze(-1).eq(rhs.unsqueeze(-2)).any(dim=-1)
+            ).sum(dim=-1).to(torch.float32)
+            pair_recalls.append(
+                intersection / torch.minimum(lhs_count, rhs_count).clamp_min(1.0)
+            )
+            pair_jaccards.append(
+                intersection
+                / (lhs_count + rhs_count - intersection).clamp_min(1.0)
+            )
+    if pair_recalls:
+        pair_recall = torch.stack(pair_recalls).mean(dim=0)
+        pair_jaccard = torch.stack(pair_jaccards).mean(dim=0)
+    else:
+        pair_recall = torch.ones_like(union_size)
+        pair_jaccard = torch.ones_like(union_size)
+
+    # Average replicated KV heads but retain request-level variation.
+    return torch.stack(
+        [
+            union_size.mean(dim=0),
+            union_expansion.mean(dim=0),
+            pair_recall.mean(dim=0),
+            pair_jaccard.mean(dim=0),
+        ],
+        dim=-1,
+    )
 
 
 def _get_minimax_num_key_value_heads(model_config) -> int:
@@ -136,7 +203,60 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # sparse layers. The forward stream orders each layer before reuse.
         self._query_sharded_cp_pack_buffers: dict[tuple, torch.Tensor] = {}
         self._query_sharded_cp_restore_buffers: dict[tuple, tuple[torch.Tensor, ...]] = {}
+        # FlashMLA index metadata is invariant across MiniMax sparse layers but
+        # not across scheduler forwards. It is cleared by
+        # init_forward_metadata_out_graph and rebuilt once per ragged CP segment.
+        self._flash_mla_prefill_index_meta: dict[str, SimpleNamespace] = {}
+        self._flash_mla_prefill_safe_pages: Optional[torch.Tensor] = None
+        self._minimax_prefill_topk_cache: dict[str, SimpleNamespace] = {}
+        self.cache_flash_mla_prefill_metadata = os.environ.get(
+            "SGLANG_MINIMAX_CACHE_PREFILL_INDEX_METADATA", "0"
+        ) in ("1", "true", "True")
         self.fp8_attn_gemm = m3_fp8_attn_gemm_enabled(runner.server_args)
+        self.triton_fp8_main_attn_gemm = (
+            envs.SGLANG_ENABLE_M3_TRITON_FP8_ATTN_GEMM.get()
+        )
+        self.triton_fp8_q_qdq_only = envs.SGLANG_M3_TRITON_FP8_Q_QDQ_ONLY.get()
+        self.fp8_finite_debug = envs.SGLANG_M3_FP8_FINITE_DEBUG.get()
+        self._fp8_nonfinite_reports: set[tuple[str, int]] = set()
+        if self.triton_fp8_main_attn_gemm and self.triton_fp8_q_qdq_only:
+            raise RuntimeError(
+                "SGLANG_ENABLE_M3_TRITON_FP8_ATTN_GEMM and "
+                "SGLANG_M3_TRITON_FP8_Q_QDQ_ONLY are mutually exclusive"
+            )
+        if self.triton_fp8_main_attn_gemm:
+            arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+            if not arch.startswith("gfx938"):
+                raise RuntimeError(
+                    "SGLANG_ENABLE_M3_TRITON_FP8_ATTN_GEMM is currently "
+                    f"validated only on gfx938, got {arch or 'non-ROCm device'}"
+                )
+            if runner.server_args.attention_backend != "triton":
+                raise RuntimeError(
+                    "SGLANG_ENABLE_M3_TRITON_FP8_ATTN_GEMM requires "
+                    "--attention-backend triton"
+                )
+            if runner.server_args.kv_cache_dtype != "fp8_e4m3":
+                raise RuntimeError(
+                    "SGLANG_ENABLE_M3_TRITON_FP8_ATTN_GEMM requires "
+                    "--kv-cache-dtype fp8_e4m3"
+                )
+            if self.kv_pool.main_pool.dtype != torch.float8_e4m3fn:
+                raise RuntimeError(
+                    "gfx938 Triton FP8 attention requires an e4m3fn main KV "
+                    f"pool, got {self.kv_pool.main_pool.dtype}"
+                )
+            if (
+                self.kv_pool.index_k_pool is None
+                or self.kv_pool.index_k_pool.dtype != runner.dtype
+            ):
+                raise RuntimeError(
+                    "gfx938 Triton FP8 main attention keeps index-K in the "
+                    "model dtype so sparse Top-K selection remains unchanged"
+                )
+        self.main_fp8_attn_gemm = (
+            self.fp8_attn_gemm or self.triton_fp8_main_attn_gemm
+        )
         if self.fp8_attn_gemm:
             assert self.kv_pool.main_pool.dtype == torch.float8_e4m3fn, (
                 "fp8 attn-GEMM mode requires an fp8_e4m3fn main KV pool, got "
@@ -149,10 +269,61 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self.dense_layer_ids, self.sparse_layer_ids = get_minimax_sparse_layer_ids(
             sparse_cfg
         )
+        self._sparse_layer_ordinal = {
+            layer_id: ordinal
+            for ordinal, layer_id in enumerate(self.sparse_layer_ids)
+        }
         self.disable_value_layer_ids: set[int] = set(
             get_minimax_sparse_disable_value_layer_ids(sparse_cfg)
         )
         self.score_type: str = get_minimax_sparse_score_type(sparse_cfg)
+        self.index_topk_freq = int(
+            os.environ.get("SGLANG_MINIMAX_INDEX_TOPK_FREQ", "1")
+        )
+        self.index_topk_mode = os.environ.get(
+            "SGLANG_MINIMAX_INDEX_TOPK_MODE", "off"
+        ).lower()
+        if self.index_topk_freq <= 0:
+            raise ValueError(
+                "SGLANG_MINIMAX_INDEX_TOPK_FREQ must be positive, got "
+                f"{self.index_topk_freq}"
+            )
+        if self.index_topk_mode not in ("off", "shadow", "reuse"):
+            raise ValueError(
+                "SGLANG_MINIMAX_INDEX_TOPK_MODE must be off, shadow, or reuse, "
+                f"got {self.index_topk_mode!r}"
+            )
+        if self.index_topk_mode != "off" and self.is_npu:
+            raise ValueError(
+                "MiniMax index top-k sharing is currently implemented only for GPU Prefill"
+            )
+        if self.index_topk_mode != "off" and self.index_topk_freq == 1:
+            logger.warning(
+                "MiniMax index top-k %s mode requested with freq=1; sharing is inactive.",
+                self.index_topk_mode,
+            )
+        if self.index_topk_mode != "off":
+            skipped_layers = [
+                layer_id
+                for layer_id in self.sparse_layer_ids
+                if minimax_sparse_layer_skips_topk(
+                    sparse_cfg, layer_id, self.index_topk_freq
+                )
+            ]
+            unsafe_layers = set(skipped_layers) - self.disable_value_layer_ids
+            if unsafe_layers:
+                raise ValueError(
+                    "MiniMax index top-k reuse cannot skip layers with an index-value "
+                    f"residual: {sorted(unsafe_layers)}"
+                )
+            logger.warning(
+                "MiniMax index top-k %s enabled: freq=%d, producer_layers=%s, "
+                "skip_layers=%s. This changes sparse block selection unless mode=shadow.",
+                self.index_topk_mode,
+                self.index_topk_freq,
+                len(self.sparse_layer_ids) - len(skipped_layers),
+                len(skipped_layers),
+            )
 
         # Plain Python int so it is safe inside CUDA graphs (no .item() at graph time).
         self._max_seqlen_q: int = 1
@@ -166,6 +337,30 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         self._verify_meta_cg: dict[tuple, SimpleNamespace] = {}
         self._target_verify_meta_cache: dict[tuple, SimpleNamespace] = {}
         self._target_verify_meta_cache_enabled = True
+        # Opt-in eager diagnostic for deciding whether TARGET_VERIFY Stage3
+        # should share selected KV tiles across speculative positions.  CUDA
+        # graph replay bypasses Python, so the recorder deliberately samples
+        # eager forwards and performs only one device sync after the final
+        # sparse layer of a sampled forward.
+        self._verify_topk_overlap_enabled = os.environ.get(
+            "SGLANG_MINIMAX_VERIFY_TOPK_OVERLAP", "0"
+        ).lower() in ("1", "true", "yes")
+        self._verify_topk_overlap_every = max(
+            1,
+            int(os.environ.get("SGLANG_MINIMAX_VERIFY_TOPK_OVERLAP_EVERY", "16")),
+        )
+        self._verify_topk_overlap_max_records = max(
+            1,
+            int(
+                os.environ.get(
+                    "SGLANG_MINIMAX_VERIFY_TOPK_OVERLAP_MAX_RECORDS", "4"
+                )
+            ),
+        )
+        self._verify_topk_overlap_seen = 0
+        self._verify_topk_overlap_records = 0
+        self._verify_topk_overlap_active = False
+        self._verify_topk_overlap_pending: list[tuple[int, torch.Tensor]] = []
 
         # Experimental query-sharded prefill CP.  Each rank computes only its
         # zigzag query slices, while Main K/V and Index K/V for the new chunk
@@ -541,6 +736,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             f"prefill_block_q={self.block_size_q}, "
             f"prefill_block_q_min_query_len={self.block_size_q_min_query_len}, "
             f"fp8_attn_gemm={self.fp8_attn_gemm}, "
+            f"triton_fp8_main_attn_gemm={self.triton_fp8_main_attn_gemm}, "
+            f"triton_fp8_q_qdq_only={self.triton_fp8_q_qdq_only}, "
             f"npu_native_attn={'on' if (self._native_sparse_ok and _native_attn_enabled()) else 'off'}, "
             f"disable_value_layers={sorted(self.disable_value_layer_ids)})"
         )
@@ -549,6 +746,134 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 "[MiniMaxSparse] fp8 MSA active: the first forward may "
                 "JIT-compile fmha_sm100 fp8 kernel variants (cold cache can "
                 "take minutes; compiles serialize across TP ranks)."
+            )
+
+    def _debug_check_main_attn_output(
+        self, output: torch.Tensor, layer_id: int, phase: str
+    ) -> None:
+        if not self.fp8_finite_debug or not self.triton_fp8_main_attn_gemm:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "SGLANG_M3_FP8_FINITE_DEBUG requires CUDA graphs to be disabled"
+            )
+        # Long prefill failures can affect complete token rows while leaving the
+        # final row finite.  Inspect one representative scalar per row first;
+        # this catches that pattern without scanning a 16K x 64 x 128 tensor at
+        # every sparse layer.  Other phases retain the complete-tensor check.
+        row_sampled = (
+            phase.startswith("prefill_q")
+            and layer_id != 34
+            and output.shape[0] > 1
+        )
+        inspected = output[:, :1, :1] if row_sampled else output
+        inspected = (
+            inspected.float()
+            if inspected.dtype == torch.float8_e4m3fn
+            else inspected
+        )
+        finite = torch.isfinite(inspected)
+        if bool(finite.all().item()):
+            return
+        report_key = (phase, int(layer_id))
+        if report_key in self._fp8_nonfinite_reports:
+            return
+        self._fp8_nonfinite_reports.add(report_key)
+        nan_count = int(torch.isnan(inspected).sum().item())
+        inf_count = int(torch.isinf(inspected).sum().item())
+        finite_count = int(finite.sum().item())
+        finite_amax = (
+            float(inspected[finite].float().abs().max().item())
+            if finite_count
+            else float("nan")
+        )
+        bad_rows = []
+        if phase.startswith("prefill_") and output.shape[0] > 1:
+            bad = (~finite.reshape(output.shape[0], -1).all(dim=1)).nonzero().flatten()
+            bad_rows = [int(value) for value in bad[:16].cpu().tolist()]
+        logger.error(
+            "MiniMax native-FP8 non-finite tensor: "
+            "phase=%s layer=%s shape=%s sampled_rows=%s bad_rows=%s "
+            "nan=%s inf=%s finite=%s amax=%s",
+            phase,
+            layer_id,
+            tuple(output.shape),
+            row_sampled,
+            bad_rows,
+            nan_count,
+            inf_count,
+            finite_count,
+            finite_amax,
+        )
+
+    def _debug_report_fp8_cache_codes(
+        self,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        source_v: torch.Tensor,
+        v_scale: Optional[float],
+        req_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        layer_id: int,
+    ) -> None:
+        seq_len = int(seq_lens[0].item())
+        if 16_000 <= seq_len <= 17_000:
+            seq_bucket = "first_16k"
+        elif seq_len >= 140_000:
+            seq_bucket = "long"
+        else:
+            return
+        report_key = (f"prefill_cache_codes_{seq_bucket}", int(layer_id))
+        if (
+            not self.fp8_finite_debug
+            or not self.triton_fp8_main_attn_gemm
+            or layer_id not in (34, 35)
+            or report_key in self._fp8_nonfinite_reports
+        ):
+            return
+        self._fp8_nonfinite_reports.add(report_key)
+        req = int(req_indices[0].item())
+        slots = self.req_to_token[req, :seq_len].long()
+        slot_zero = int((slots == 0).sum().item())
+        slot_min = int(slots.min().item())
+        slot_max = int(slots.max().item())
+        for name, cache in (("K", k_cache), ("V", v_cache)):
+            # Gather the raw byte view. GPU index_select on float8 tensors is
+            # not reliable on this stack and can itself synthesize 0x7f.
+            codes = cache.view(torch.uint8).index_select(0, slots)
+            pos_max = int((codes == 0x7E).sum().item())
+            neg_max = int((codes == 0xFE).sum().item())
+            pos_nan = int((codes == 0x7F).sum().item())
+            neg_nan = int((codes == 0xFF).sum().item())
+            neg_zero = int((codes == 0x80).sum().item())
+            source_detail = ""
+            if name == "V" and neg_nan and seq_bucket == "first_16k":
+                coord = (codes == 0xFF).nonzero()[0]
+                token, head, dim = [int(value) for value in coord.cpu().tolist()]
+                source_value = float(source_v[token, head, dim].float().item())
+                source_detail = (
+                    f" first_neg_nan=[{token},{head},{dim}]"
+                    f" source_v={source_value} v_scale={v_scale}"
+                    f" scaled={source_value / float(v_scale or 1.0)}"
+                )
+            logger.error(
+                "MiniMax native-FP8 cache code audit: layer=%s cache=%s "
+                "bucket=%s seq_len=%s shape=%s slots=[%s,%s] slot_zero=%s "
+                "+max=%s -max=%s +nan=%s -nan=%s -zero=%s%s",
+                layer_id,
+                name,
+                seq_bucket,
+                seq_len,
+                tuple(cache.shape),
+                slot_min,
+                slot_max,
+                slot_zero,
+                pos_max,
+                neg_max,
+                pos_nan,
+                neg_nan,
+                neg_zero,
+                source_detail,
             )
 
     def _select_gpu_prefill_block_size_q(self) -> int:
@@ -680,12 +1005,98 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
         return meta
 
+    def _record_target_verify_topk_overlap(
+        self,
+        layer_id: int,
+        topk_idx: torch.Tensor,
+        batch_size: int,
+        verify_width: int,
+        seq_lens: torch.Tensor,
+    ) -> None:
+        """Aggregate exact per-query TopK reuse metrics for one verify forward.
+
+        The diagnostic is intentionally eager-only.  Per-layer statistics stay
+        on device; the last sparse layer copies the small aggregate to CPU once.
+        ``union_expansion`` is union-size divided by the mean per-query set size:
+        1.0 means all verify positions selected the same blocks, while a value
+        near ``verify_width`` means almost no selected-KV reuse is available.
+        """
+        if not self._verify_topk_overlap_enabled:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            return
+
+        first_layer = layer_id == self.sparse_layer_ids[0]
+        last_layer = layer_id == self.sparse_layer_ids[-1]
+        if first_layer:
+            self._verify_topk_overlap_seen += 1
+            self._verify_topk_overlap_pending.clear()
+            self._verify_topk_overlap_active = (
+                self._verify_topk_overlap_records
+                < self._verify_topk_overlap_max_records
+                and (self._verify_topk_overlap_seen - 1)
+                % self._verify_topk_overlap_every
+                == 0
+            )
+        if not self._verify_topk_overlap_active:
+            return
+
+        metrics = _compute_verify_topk_overlap_metrics(
+            topk_idx,
+            batch_size,
+            verify_width,
+        )
+        self._verify_topk_overlap_pending.append((layer_id, metrics))
+
+        if not last_layer:
+            return
+
+        layer_ids = [item[0] for item in self._verify_topk_overlap_pending]
+        values = torch.stack(
+            [item[1] for item in self._verify_topk_overlap_pending], dim=0
+        ).to(device="cpu", dtype=torch.float32)
+        seq_lens_cpu = seq_lens.detach().to(device="cpu", dtype=torch.int64).tolist()
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        payload = {
+            "rank": rank,
+            "sample": self._verify_topk_overlap_records,
+            "batch_size": int(batch_size),
+            "verify_width": int(verify_width),
+            "seq_lens": seq_lens_cpu,
+            "layers": [
+                {
+                    "layer": int(layer),
+                    "union_mean": round(float(layer_values[:, 0].mean()), 4),
+                    "union_p90": round(
+                        float(torch.quantile(layer_values[:, 0], 0.9)), 4
+                    ),
+                    "union_expansion_mean": round(
+                        float(layer_values[:, 1].mean()), 6
+                    ),
+                    "pair_recall_mean": round(
+                        float(layer_values[:, 2].mean()), 6
+                    ),
+                    "pair_jaccard_mean": round(
+                        float(layer_values[:, 3].mean()), 6
+                    ),
+                }
+                for layer, layer_values in zip(layer_ids, values)
+            ],
+        }
+        logger.info("[MiniMaxVerifyTopKOverlap] %s", json.dumps(payload))
+        self._verify_topk_overlap_records += 1
+        self._verify_topk_overlap_active = False
+        self._verify_topk_overlap_pending.clear()
+
     def init_forward_metadata_out_graph(
         self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
         # getattr covers replay views lacking extend_seq_lens_cpu and TARGET_VERIFY.
         self._msa_dec_meta = None
         self._flash_mla_page_table = None
+        self._flash_mla_prefill_index_meta.clear()
+        self._flash_mla_prefill_safe_pages = None
+        self._minimax_prefill_topk_cache.clear()
         if (
             not self.is_npu
             and forward_batch.forward_mode.is_target_verify()
@@ -741,9 +1152,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                         "gfx938 FlashMLA TARGET_VERIFY requires reusable packed "
                         "request metadata"
                     )
+                # Native FlashMLA target verify keeps speculative positions in
+                # the s_q dimension. The page mapping is request-invariant;
+                # per-position sequence bounds are passed separately below.
                 self._prepare_flash_mla_page_table(
-                    verify_meta.per_query_req,
-                    verify_meta.per_query_seq_lens,
+                    forward_batch.req_pool_indices,
+                    verify_meta.seq_matrix[:, -1],
                 )
             else:
                 self._prepare_flash_mla_page_table(
@@ -867,9 +1281,17 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         )
         self._flash_mla_page_table = table
 
-    def _get_flash_mla_sched_meta(self, layer_id: int, rows: int):
+    def _get_flash_mla_sched_meta(
+        self, layer_id: int, rows: int, verify_group_size: int = 1
+    ):
         """Keep one initialized FlashMLA scheduler object per layer/graph shape."""
-        key = (int(layer_id), int(rows))
+        verify_group_size = int(verify_group_size)
+        if verify_group_size <= 0 or int(rows) % verify_group_size:
+            raise ValueError(
+                "FlashMLA scheduler rows must be divisible by "
+                f"verify_group_size, got {rows} and {verify_group_size}"
+            )
+        key = (int(layer_id), int(rows) // verify_group_size, verify_group_size)
         meta = self._flash_mla_sched_meta.get(key)
         if meta is None:
             from sglang.srt.layers.attention.minimax_sparse_ops.flash_mla_gfx938 import (
@@ -886,15 +1308,23 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         device: torch.device,
         *,
         decode: bool,
+        verify_group_size: int = 1,
     ) -> torch.Tensor:
         """Reuse the page-expanded Top16 workspace across sparse layers."""
         rows = int(rows)
         if decode:
-            key = (device.type, device.index, rows)
+            verify_group_size = int(verify_group_size)
+            if verify_group_size <= 0 or rows % verify_group_size:
+                raise ValueError(
+                    "FlashMLA workspace rows must be divisible by "
+                    f"verify_group_size, got {rows} and {verify_group_size}"
+                )
+            batch = rows // verify_group_size
+            key = (device.type, device.index, batch, verify_group_size)
             output = self._flash_mla_decode_indices.get(key)
             if output is None:
                 output = torch.empty(
-                    (rows, 1, 4, 16 * self.block_size_k),
+                    (batch, verify_group_size, 4, 16 * self.block_size_k),
                     dtype=torch.int32,
                     device=device,
                 )
@@ -1813,14 +2243,132 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             self._extend_meta_key = id(forward_batch)
         return cu_seqlens, seq_lens, prefix_lens
 
+    def _get_flash_mla_prefill_index_meta(
+        self,
+        cache_key: str,
+        cu_seqlens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        q_lens: torch.Tensor,
+        q_lens_cpu,
+        num_queries: int,
+        device: torch.device,
+    ) -> SimpleNamespace:
+        """Return forward-local prefix/K-end metadata for one ragged segment."""
+        if not (
+            self.cache_flash_mla_prefill_metadata
+            and self.use_flash_mla_gfx938_indexer
+        ):
+            return SimpleNamespace(prefix_lens=seq_lens - q_lens, k_end=None)
+
+        meta = self._flash_mla_prefill_index_meta.get(cache_key)
+        if meta is not None:
+            if meta.num_queries != int(num_queries) or meta.q_lens_cpu != tuple(
+                int(x) for x in q_lens_cpu
+            ):
+                raise RuntimeError(
+                    "MiniMax FlashMLA forward-local metadata cache shape changed "
+                    f"for {cache_key}: cached rows={meta.num_queries}, "
+                    f"current rows={num_queries}"
+                )
+            return meta
+
+        from sglang.srt.layers.attention.minimax_sparse_ops.flash_mla_gfx938 import (
+            build_flash_mla_sparse_prefill_k_end,
+        )
+
+        prefix_lens = seq_lens - q_lens
+        k_end = build_flash_mla_sparse_prefill_k_end(
+            cu_seqlens,
+            prefix_lens,
+            q_lens,
+            num_queries,
+            device,
+        )
+        meta = SimpleNamespace(
+            prefix_lens=prefix_lens,
+            k_end=k_end,
+            num_queries=int(num_queries),
+            q_lens_cpu=tuple(int(x) for x in q_lens_cpu),
+        )
+        self._flash_mla_prefill_index_meta[cache_key] = meta
+        return meta
+
+    def _minimax_layer_skips_topk(self, layer_id: int) -> bool:
+        if self.index_topk_mode == "off" or self.index_topk_freq == 1:
+            return False
+        ordinal = self._sparse_layer_ordinal.get(layer_id)
+        return ordinal is not None and ordinal % self.index_topk_freq != 0
+
+    def _record_minimax_topk_shadow_overlap(
+        self,
+        layer_id: int,
+        cache_key: str,
+        producer_layer_id: int,
+        producer_topk: torch.Tensor,
+        native_topk: torch.Tensor,
+    ) -> None:
+        if producer_topk.shape != native_topk.shape:
+            raise RuntimeError(
+                "MiniMax top-k shadow shape changed within one forward: "
+                f"producer={tuple(producer_topk.shape)}, "
+                f"native={tuple(native_topk.shape)}"
+            )
+        # Shadow mode is diagnostic rather than a performance path. Sample a
+        # bounded number of evenly-spaced query rows to keep comparison cost
+        # independent of a 128K/16K request while still covering the sequence.
+        rows = int(native_topk.shape[1])
+        sample_rows = min(
+            rows,
+            int(os.environ.get("SGLANG_MINIMAX_INDEX_TOPK_SHADOW_ROWS", "256")),
+        )
+        if sample_rows <= 0:
+            return
+        if sample_rows == rows:
+            native = native_topk
+            producer = producer_topk
+        else:
+            sample = torch.linspace(
+                0,
+                rows - 1,
+                sample_rows,
+                device=native_topk.device,
+                dtype=torch.float32,
+            ).round().to(torch.long)
+            native = native_topk.index_select(1, sample)
+            producer = producer_topk.index_select(1, sample)
+        valid = native.ge(0)
+        matches = (
+            native.unsqueeze(-1).eq(producer.unsqueeze(-2)).any(dim=-1) & valid
+        )
+        denominator = int(valid.sum().item())
+        overlap = (
+            float(matches.sum().item()) / denominator if denominator > 0 else 1.0
+        )
+        if get_parallel().attn_cp_rank == 0:
+            logger.info(
+                "[MiniMaxTopKReuseShadow] layer=%d producer_layer=%d segment=%s "
+                "rows=%d sampled_rows=%d overlap=%.8f",
+                layer_id,
+                producer_layer_id,
+                cache_key,
+                rows,
+                sample_rows,
+                overlap,
+            )
+
     def _materialize_query_sharded_cp_kv(
         self,
         forward_batch: ForwardBatch,
         k: torch.Tensor,
         v: torch.Tensor,
-        idx_k: torch.Tensor,
+        idx_k: Optional[torch.Tensor],
         idx_v: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         """All-gather one CP-local MiniMax KV payload in a single collective."""
         strategy = get_cp_strategy()
         if strategy is None or strategy.name != "zigzag":
@@ -1828,7 +2376,12 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 "MiniMax query-sharded CP requires CP-v2 with --cp-strategy zigzag"
             )
 
-        parts = [k, v, idx_k]
+        if idx_v is not None and idx_k is None:
+            raise RuntimeError("MiniMax index V cannot be materialized without index K")
+        has_idx_k = idx_k is not None
+        parts = [k, v]
+        if idx_k is not None:
+            parts.append(idx_k)
         if idx_v is not None:
             parts.append(idx_v)
         if len({part.dtype for part in parts}) != 1:
@@ -1867,7 +2420,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             packed[:local_rows], forward_batch, torch.cuda.current_stream()
         )
         return self._restore_query_sharded_cp_kv(
-            packed_full, shapes, widths, idx_v is not None
+            packed_full,
+            shapes,
+            widths,
+            has_idx_k=has_idx_k,
+            has_idx_v=idx_v is not None,
         )
 
     def _restore_query_sharded_cp_kv(
@@ -1875,8 +2432,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         packed_full: torch.Tensor,
         shapes: list[tuple],
         widths: list[int],
+        has_idx_k: bool,
         has_idx_v: bool,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
         full_rows = int(packed_full.shape[0])
 
         # In the normal BF16 KV-cache path, packed_full has a contiguous inner
@@ -1885,21 +2448,27 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # full-size device-to-device restore copies. Quantized pools retain
         # the old contiguous restore path because their quantizers may mutate
         # or reinterpret the source tensor.
-        index_pool = (
-            self.kv_pool.index_kv_pool if has_idx_v else self.kv_pool.index_k_pool
-        )
+        index_pool = None
+        if has_idx_k:
+            index_pool = (
+                self.kv_pool.index_kv_pool
+                if has_idx_v
+                else self.kv_pool.index_k_pool
+            )
         # ``MHATokenToKOnlyPool`` is an unquantized raw-storage pool and does
         # not expose the quant-method based property used by the regular MHA
         # pool.  Fall back to its storage dtype contract instead of assuming
         # every index-pool implementation has ``is_quantized_kv_cache``.
-        index_pool_is_quantized = index_pool is None or (
-            getattr(index_pool, "is_quantized_kv_cache")
-            if hasattr(index_pool, "is_quantized_kv_cache")
-            else index_pool.store_dtype != index_pool.dtype
+        index_pool_is_quantized = bool(
+            index_pool is not None
+            and (
+                getattr(index_pool, "is_quantized_kv_cache")
+                if hasattr(index_pool, "is_quantized_kv_cache")
+                else index_pool.store_dtype != index_pool.dtype
+            )
         )
         zero_copy_restore = (
-            index_pool is not None
-            and not self.kv_pool.main_pool.is_quantized_kv_cache
+            not self.kv_pool.main_pool.is_quantized_kv_cache
             and not index_pool_is_quantized
         )
         if zero_copy_restore:
@@ -1912,14 +2481,15 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     )
                 )
                 offset += width
-            return (
-                views[0],
-                views[1],
-                views[2],
-                views[3] if has_idx_v else None,
+            return views[0], views[1], (views[2] if has_idx_k else None), (
+                views[3] if has_idx_v else None
             )
 
-        restore_key = (k.device.index, k.dtype, tuple(shapes))
+        restore_key = (
+            packed_full.device.index,
+            packed_full.dtype,
+            tuple(shapes),
+        )
         restore_buffers = self._query_sharded_cp_restore_buffers.get(restore_key)
         if restore_buffers is None or restore_buffers[0].shape[0] < full_rows:
             old_capacity = (
@@ -1930,7 +2500,9 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             capacity = max(full_rows, 2 * old_capacity)
             restore_buffers = tuple(
                 torch.empty(
-                    (capacity, *shape), dtype=k.dtype, device=k.device
+                    (capacity, *shape),
+                    dtype=packed_full.dtype,
+                    device=packed_full.device,
                 )
                 for shape in shapes
             )
@@ -1940,11 +2512,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         for dst, width, shape in zip(restored, widths, shapes):
             dst.copy_(packed_full[:, offset : offset + width].reshape(full_rows, *shape))
             offset += width
-        return (
-            restored[0],
-            restored[1],
-            restored[2],
-            restored[3] if has_idx_v else None,
+        return restored[0], restored[1], (restored[2] if has_idx_k else None), (
+            restored[3] if has_idx_v else None
         )
 
     def forward_extend(
@@ -1956,11 +2525,27 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
         *,
-        idx_q: torch.Tensor,
-        idx_k: torch.Tensor,
+        idx_q: Optional[torch.Tensor],
+        idx_k: Optional[torch.Tensor],
         idx_v: Optional[torch.Tensor],
     ):
         disable_value = layer.layer_id in self.disable_value_layer_ids
+        skip_topk = (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and self._minimax_layer_skips_topk(layer.layer_id)
+        )
+        producer_elided = idx_q is None or idx_k is None
+        if producer_elided and not (
+            self.index_topk_mode == "reuse" and skip_topk and disable_value
+        ):
+            raise RuntimeError(
+                "MiniMax index producer tensors may be omitted only on a "
+                "disabled-index-value Prefill top-k reuse layer: "
+                f"layer={layer.layer_id}, mode={self.index_topk_mode}, "
+                f"skip={skip_topk}, disable_value={disable_value}"
+            )
+        if (idx_q is None) != (idx_k is None):
+            raise RuntimeError("MiniMax index Q and K must be elided together")
         cp_active = is_cp_v2_active(forward_batch)
         if cp_active:
             if not self.enable_query_sharded_cp:
@@ -1989,27 +2574,51 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         kv_cached_by_fusion = self._is_sparse_kv_cached_by_fusion(
             forward_batch, layer.layer_id
         )
+        if self.fp8_finite_debug and layer.layer_id in (33, 34):
+            self._debug_check_main_attn_output(
+                q, layer.layer_id, "prefill_q_pre_store"
+            )
+            self._debug_check_main_attn_output(
+                k, layer.layer_id, "prefill_k_pre_store"
+            )
+            self._debug_check_main_attn_output(
+                v, layer.layer_id, "prefill_v_pre_store"
+            )
         # A fused QKNorm/RoPE projection can only have stored this CP rank's
         # local token rows. Query-sharded MiniMax CP needs every rank to own
         # the complete new-chunk sparse KV, so overwrite that partial write
         # with the globally materialized tensors.
         store_loc, dcp_kv_mask = self._cache_store_loc_and_mask(forward_batch)
         if self.dcp_size > 1 or cp_active or not kv_cached_by_fusion:
-            self.kv_pool.set_fused_kv_index_buffer(
-                layer,
-                store_loc,
-                k,
-                v,
-                idx_k,
-                None if disable_value else idx_v,
-                layer.k_scale_float,
-                layer.v_scale_float,
-                layer.idx_k_scale_float,
-                layer.idx_v_scale_float,
-                dcp_kv_mask=dcp_kv_mask,
-            )
+            if idx_k is None:
+                self.kv_pool.set_kv_buffer(
+                    layer,
+                    store_loc,
+                    k,
+                    v,
+                    layer.k_scale_float,
+                    layer.v_scale_float,
+                    dcp_kv_mask=dcp_kv_mask,
+                )
+            else:
+                self.kv_pool.set_fused_kv_index_buffer(
+                    layer,
+                    store_loc,
+                    k,
+                    v,
+                    idx_k,
+                    None if disable_value else idx_v,
+                    layer.k_scale_float,
+                    layer.v_scale_float,
+                    layer.idx_k_scale_float,
+                    layer.idx_v_scale_float,
+                    dcp_kv_mask=dcp_kv_mask,
+                )
         k_cache, v_cache = self.kv_pool.get_kv_buffer(layer.layer_id)
-        if disable_value:
+        if idx_k is None:
+            idx_k_cache = None
+            idx_v_cache = None
+        elif disable_value:
             idx_k_cache = self.kv_pool.get_index_k_buffer(layer.layer_id)
             idx_v_cache = None
         else:
@@ -2080,15 +2689,23 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 per_query_req = meta.per_query_req
                 per_query_seq_lens = meta.per_query_seq_lens
 
-            if self.fp8_attn_gemm:
+            if self.main_fp8_attn_gemm:
                 q = _quant_q_fp8(q, layer.q_scale_float)
+            elif self.triton_fp8_q_qdq_only:
+                if layer.q_scale_float is not None:
+                    raise RuntimeError("Q-QDQ diagnostic currently requires unit q_scale")
+                q = _quant_q_fp8(q, None).to(q.dtype)
+            if self.fp8_attn_gemm:
                 idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
 
             from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
                 minimax_sparse_decode,
             )
 
-            idx_o, o = minimax_sparse_decode(
+            record_verify_topk = self._verify_topk_overlap_enabled and not (
+                torch.cuda.is_current_stream_capturing()
+            )
+            result = minimax_sparse_decode(
                 q,
                 None,
                 k_cache,
@@ -2118,14 +2735,17 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 flash_mla_page_table=self._flash_mla_page_table,
                 flash_mla_sched_meta=(
                     self._get_flash_mla_sched_meta(
-                        layer.layer_id, logical_num_tokens
+                        layer.layer_id, logical_num_tokens, ndt
                     )
                     if self._flash_mla_decode_current
                     else None
                 ),
                 flash_mla_indices_output=(
                     self._get_flash_mla_indices_output(
-                        logical_num_tokens, q.device, decode=True
+                        logical_num_tokens,
+                        q.device,
+                        decode=True,
+                        verify_group_size=ndt,
                     )
                     if self._flash_mla_decode_current
                     else None
@@ -2140,6 +2760,21 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 dcp_rank=self.dcp_rank,
                 dcp_group=self.dcp_group,
                 verify_group_size=ndt,
+                return_topk_idx=record_verify_topk,
+            )
+            if record_verify_topk:
+                idx_o, o, verify_topk_idx = result
+                self._record_target_verify_topk_overlap(
+                    layer.layer_id,
+                    verify_topk_idx,
+                    bs,
+                    ndt,
+                    forward_batch.seq_lens,
+                )
+            else:
+                idx_o, o = result
+            self._debug_check_main_attn_output(
+                o, layer.layer_id, "target_verify"
             )
             o = o.reshape(logical_num_tokens, -1).contiguous()
             if idx_o is not None:
@@ -2171,7 +2806,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         original_num_tokens = q.shape[0]
         if actual_num_tokens < original_num_tokens:
             q = q[:actual_num_tokens]
-            idx_q = idx_q[:actual_num_tokens]
+            if idx_q is not None:
+                idx_q = idx_q[:actual_num_tokens]
 
         if self.is_npu:
             if forward_batch.forward_mode.is_target_verify():
@@ -2203,9 +2839,25 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         else:
             # fp8 attention GEMMs: quantize q/idx_q after the KV store (which
             # reads the bf16 k/v) and the DP trim.
-            if self.fp8_attn_gemm:
+            if self.main_fp8_attn_gemm:
                 q = _quant_q_fp8(q, layer.q_scale_float)
-                idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
+            elif self.triton_fp8_q_qdq_only:
+                if layer.q_scale_float is not None:
+                    raise RuntimeError("Q-QDQ diagnostic currently requires unit q_scale")
+                q = _quant_q_fp8(q, None).to(q.dtype)
+            if self.fp8_attn_gemm:
+                if idx_q is not None:
+                    idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
+            self._debug_check_main_attn_output(q, layer.layer_id, "prefill_q_rows")
+            self._debug_report_fp8_cache_codes(
+                k_cache,
+                v_cache,
+                v,
+                layer.v_scale_float,
+                forward_batch.req_pool_indices,
+                seq_lens,
+                layer.layer_id,
+            )
 
             # GPU (CUDA/ROCm) sparse path; imported here so NPU never touches it.
             from sglang.srt.layers.attention.minimax_sparse_ops.minimax_sparse import (
@@ -2220,6 +2872,19 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             logical_max_seqlen_q = max(
                 forward_batch.extend_seq_lens_cpu or [self._max_seqlen_q]
             )
+            flash_mla_safe_pages = None
+            if (
+                self.cache_flash_mla_prefill_metadata
+                and self.use_flash_mla_gfx938_indexer
+            ):
+                if self._flash_mla_prefill_safe_pages is None:
+                    self._flash_mla_prefill_safe_pages = (
+                        self._flash_mla_page_table.clamp_min(0)
+                        .reshape(-1)
+                        .contiguous()
+                    )
+                flash_mla_safe_pages = self._flash_mla_prefill_safe_pages
+
             def run_sparse_segment(
                 segment_q,
                 segment_idx_q,
@@ -2230,8 +2895,20 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 segment_max_q,
                 segment_max_k,
                 segment_slot_ids=None,
+                flash_mla_prefill_k_end=None,
+                topk_cache_key="full",
             ):
-                return minimax_sparse_prefill(
+                track_topk = self.index_topk_mode != "off" and self.index_topk_freq > 1
+                cache_entry = self._minimax_prefill_topk_cache.get(topk_cache_key)
+                reused_topk = None
+                if skip_topk and self.index_topk_mode == "reuse":
+                    if cache_entry is None:
+                        raise RuntimeError(
+                            "MiniMax Prefill top-k reuse layer has no producer output: "
+                            f"layer={layer.layer_id}, segment={topk_cache_key}"
+                        )
+                    reused_topk = cache_entry.topk_idx
+                result = minimax_sparse_prefill(
                     segment_q,
                     k_cache,
                     v_cache,
@@ -2273,6 +2950,8 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                         if self.use_flash_mla_gfx938
                         else None
                     ),
+                    flash_mla_prefill_k_end=flash_mla_prefill_k_end,
+                    flash_mla_safe_pages=flash_mla_safe_pages,
                     seqlens_cpu=segment_q_lens_cpu,
                     q_scale=layer.q_scale_float,
                     k_scale=layer.k_scale_float,
@@ -2284,7 +2963,31 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     dcp_rank=self.dcp_rank,
                     dcp_group=self.dcp_group,
                     logical_max_seqlen_q=logical_max_seqlen_q,
+                    precomputed_topk_idx=reused_topk,
+                    return_topk_idx=track_topk,
                 )
+                if not track_topk:
+                    return result
+                idx_out, attn_out, native_or_reused_topk = result
+                if not skip_topk:
+                    self._minimax_prefill_topk_cache[topk_cache_key] = SimpleNamespace(
+                        layer_id=layer.layer_id,
+                        topk_idx=native_or_reused_topk,
+                    )
+                elif self.index_topk_mode == "shadow":
+                    if cache_entry is None:
+                        raise RuntimeError(
+                            "MiniMax Prefill top-k shadow layer has no producer output: "
+                            f"layer={layer.layer_id}, segment={topk_cache_key}"
+                        )
+                    self._record_minimax_topk_shadow_overlap(
+                        layer.layer_id,
+                        topk_cache_key,
+                        cache_entry.layer_id,
+                        cache_entry.topk_idx,
+                        native_or_reused_topk,
+                    )
+                return idx_out, attn_out
 
             if cp_active:
                 cp_meta = forward_batch.attn_cp_metadata
@@ -2320,12 +3023,25 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                         cp_meta.actual_seq_q_prev_list
                         + cp_meta.actual_seq_q_next_list
                     )
-                    idx_o, o = run_sparse_segment(
-                        q[:actual_num_tokens],
-                        idx_q[:actual_num_tokens],
+                    combined_meta = self._get_flash_mla_prefill_index_meta(
+                        "cp_combined",
                         combined_cu,
                         combined_seq_lens,
-                        combined_seq_lens - combined_q_lens,
+                        combined_q_lens,
+                        combined_q_lens_cpu,
+                        actual_num_tokens,
+                        q.device,
+                    )
+                    idx_o, o = run_sparse_segment(
+                        q[:actual_num_tokens],
+                        (
+                            None
+                            if idx_q is None
+                            else idx_q[:actual_num_tokens]
+                        ),
+                        combined_cu,
+                        combined_seq_lens,
+                        combined_meta.prefix_lens,
                         combined_q_lens_cpu,
                         max(
                             cp_meta.max_seqlen_q_prev,
@@ -2337,12 +3053,14 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                             default=0,
                         ),
                         combined_slots,
+                        combined_meta.k_end,
+                        "cp_combined",
                     )
                 else:
                     segment_specs = (
                         (
                             q[:split_at],
-                            idx_q[:split_at],
+                            None if idx_q is None else idx_q[:split_at],
                             cp_meta.cu_seqlens_q_prev_tensor,
                             cp_meta.kv_len_prev_tensor,
                             cp_meta.actual_seq_q_prev_tensor,
@@ -2352,7 +3070,11 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                         ),
                         (
                             q[split_at:actual_num_tokens],
-                            idx_q[split_at:actual_num_tokens],
+                            (
+                                None
+                                if idx_q is None
+                                else idx_q[split_at:actual_num_tokens]
+                            ),
                             cp_meta.cu_seqlens_q_next_tensor,
                             cp_meta.kv_len_next_tensor,
                             cp_meta.actual_seq_q_next_tensor,
@@ -2362,7 +3084,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                         ),
                     )
 
-                    def launch_segment(spec):
+                    def launch_segment(spec, cache_key):
                         (
                             segment_q,
                             segment_idx_q,
@@ -2373,15 +3095,26 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                             max_q,
                             kv_lens_cpu,
                         ) = spec
+                        segment_meta = self._get_flash_mla_prefill_index_meta(
+                            cache_key,
+                            segment_cu,
+                            segment_kv_lens,
+                            segment_q_lens,
+                            q_lens_cpu,
+                            segment_q.shape[0],
+                            segment_q.device,
+                        )
                         return run_sparse_segment(
                             segment_q,
                             segment_idx_q,
                             segment_cu,
                             segment_kv_lens,
-                            segment_kv_lens - segment_q_lens,
+                            segment_meta.prefix_lens,
                             q_lens_cpu,
                             max_q,
                             max(kv_lens_cpu, default=0),
+                            flash_mla_prefill_k_end=segment_meta.k_end,
+                            topk_cache_key=cache_key,
                         )
 
                     segment_outputs = []
@@ -2405,13 +3138,20 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                             self._minimax_cp_segment_streams = streams
                         for stream in streams:
                             stream.wait_stream(current_stream)
-                        for spec, stream in zip(segment_specs, streams):
+                        for segment_id, (spec, stream) in enumerate(
+                            zip(segment_specs, streams)
+                        ):
                             with torch.cuda.stream(stream):
-                                segment_outputs.append(launch_segment(spec))
+                                segment_outputs.append(
+                                    launch_segment(spec, f"cp_segment_{segment_id}")
+                                )
                         for stream in streams:
                             current_stream.wait_stream(stream)
                     else:
-                        segment_outputs = [launch_segment(spec) for spec in segment_specs]
+                        segment_outputs = [
+                            launch_segment(spec, f"cp_segment_{segment_id}")
+                            for segment_id, spec in enumerate(segment_specs)
+                        ]
                     idx_parts, out_parts = zip(*segment_outputs)
                     idx_o = (
                         None
@@ -2420,16 +3160,33 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                     )
                     o = torch.cat(out_parts, dim=0)
             else:
+                full_q_lens = (
+                    forward_batch.extend_seq_lens
+                    if forward_batch.extend_seq_lens is not None
+                    else seq_lens - prefix_lens
+                )
+                full_meta = self._get_flash_mla_prefill_index_meta(
+                    "full",
+                    cu_seqlens,
+                    seq_lens,
+                    full_q_lens,
+                    forward_batch.extend_seq_lens_cpu or [q.shape[0]],
+                    q.shape[0],
+                    q.device,
+                )
                 idx_o, o = run_sparse_segment(
                     q,
                     idx_q,
                     cu_seqlens,
                     seq_lens,
-                    prefix_lens,
+                    full_meta.prefix_lens,
                     forward_batch.extend_seq_lens_cpu or [q.shape[0]],
                     self._max_seqlen_q,
                     self._max_seqlen_k,
+                    flash_mla_prefill_k_end=full_meta.k_end,
+                    topk_cache_key="full",
                 )
+        self._debug_check_main_attn_output(o, layer.layer_id, "prefill_output_rows")
         if actual_num_tokens < original_num_tokens:
             pad_len = original_num_tokens - actual_num_tokens
             o = torch.cat([o, o.new_zeros(pad_len, *o.shape[1:])], dim=0)
@@ -2558,8 +3315,13 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             )
         else:
             # fp8 attn-GEMM: quantize q/idx_q after the KV store (reads bf16 k/v).
-            if self.fp8_attn_gemm:
+            if self.main_fp8_attn_gemm:
                 q = _quant_q_fp8(q, layer.q_scale_float)
+            elif self.triton_fp8_q_qdq_only:
+                if layer.q_scale_float is not None:
+                    raise RuntimeError("Q-QDQ diagnostic currently requires unit q_scale")
+                q = _quant_q_fp8(q, None).to(q.dtype)
+            if self.fp8_attn_gemm:
                 idx_q = _quant_q_fp8(idx_q, layer.idx_q_scale_float)
 
             # GPU (CUDA/ROCm) sparse path; imported here so NPU never touches it.
@@ -2620,6 +3382,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 dcp_rank=self.dcp_rank,
                 dcp_group=self.dcp_group,
             )
+        self._debug_check_main_attn_output(o, layer.layer_id, "decode")
         return (
             None if idx_o is None else idx_o.reshape(q.shape[0], -1).contiguous(),
             o.reshape(q.shape[0], -1).contiguous(),

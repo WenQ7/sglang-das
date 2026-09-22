@@ -2,7 +2,7 @@
 
 import logging
 import os
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 
@@ -21,6 +21,7 @@ from sglang.kernels.ops.attention.minimax_sparse.prefill.topk_sparse import (
     build_query_group_topk_union,
     flash_prefill_with_gqa_share_sparse,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.comm import cp_lse_ag_out_rs_mha
 
 logger = logging.getLogger(__name__)
@@ -61,8 +62,12 @@ def minimax_sparse_prefill(
     k_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged main)
     v_cache: torch.Tensor,  # [max_slots, num_kv_heads, head_dim] (paged main)
     sink: Optional[torch.Tensor],  # [num_q_heads, qk_head_dim]
-    idx_q: torch.Tensor,  # [total_extend_tokens, num_idx_heads, idx_head_dim]
-    idx_k_cache: torch.Tensor,  # [max_slots, 1, idx_head_dim] (paged index)
+    idx_q: Optional[
+        torch.Tensor
+    ],  # [total_extend_tokens, num_idx_heads, idx_head_dim], or None with reused top-k
+    idx_k_cache: Optional[
+        torch.Tensor
+    ],  # [max_slots, 1, idx_head_dim], or None with reused top-k
     idx_v_cache: Optional[
         torch.Tensor
     ],  # [max_slots, 1, idx_head_dim] (paged index); None when disable_index_value
@@ -88,6 +93,8 @@ def minimax_sparse_prefill(
     use_flash_mla_gfx938_indexer: bool = False,
     flash_mla_page_table: Optional[torch.Tensor] = None,
     flash_mla_indices_output: Optional[torch.Tensor] = None,
+    flash_mla_prefill_k_end: Optional[torch.Tensor] = None,
+    flash_mla_safe_pages: Optional[torch.Tensor] = None,
     cu_seqblocks_q: Optional[torch.Tensor] = None,
     max_seqblock_q: Optional[int] = None,
     all_seqblock_q: Optional[int] = None,
@@ -102,6 +109,8 @@ def minimax_sparse_prefill(
     dcp_rank: int = 0,
     dcp_group=None,
     logical_max_seqlen_q: Optional[int] = None,
+    precomputed_topk_idx: Optional[torch.Tensor] = None,
+    return_topk_idx: bool = False,
 ):
     """Run MiniMax-M3 sparse prefill.
 
@@ -220,9 +229,35 @@ def minimax_sparse_prefill(
         os.environ.get("SGLANG_MINIMAX_PREFILL_FUSED_TOPK_UNION", "0") == "1"
     )
 
-    # Step 1/2: index score and exact TopK.  Full gfx938 FlashMLA mode replaces
-    # both kernels; the established Triton/AITER producer remains the fallback.
-    if use_flash_mla_gfx938_indexer:
+    # Step 1/2: index score and exact TopK. A reused tensor is already in the
+    # post-head-reduction [KV head, query, TopK] contract and bypasses the
+    # complete index producer. Full gfx938 FlashMLA mode replaces both kernels;
+    # the established Triton/AITER producer remains the fallback.
+    if precomputed_topk_idx is not None:
+        if not disable_index_value:
+            raise ValueError(
+                "MiniMax prefill top-k reuse requires sparse index value to be disabled"
+            )
+        if precomputed_topk_idx.device != q.device:
+            raise ValueError(
+                "MiniMax prefill reused top-k must be on the query device"
+            )
+        if precomputed_topk_idx.dtype != torch.int32:
+            raise ValueError(
+                "MiniMax prefill reused top-k must use int32 indices, got "
+                f"{precomputed_topk_idx.dtype}"
+            )
+        if precomputed_topk_idx.shape[1:] != (q.shape[0], topk):
+            raise ValueError(
+                "MiniMax prefill reused top-k shape mismatch: expected "
+                f"[heads, {q.shape[0]}, {topk}], got "
+                f"{tuple(precomputed_topk_idx.shape)}"
+            )
+        idx_o = None
+        topk_idx = precomputed_topk_idx
+    elif use_flash_mla_gfx938_indexer:
+        if idx_q is None or idx_k_cache is None:
+            raise ValueError("FlashMLA MiniMax index producer requires index Q/K")
         if score_type != "max" or not disable_index_value or idx_sink is not None:
             raise NotImplementedError(
                 "gfx938 FlashMLA MSA128 indexer requires score_type=max, "
@@ -247,8 +282,12 @@ def minimax_sparse_prefill(
             topk,
             init_blocks,
             local_blocks,
+            flash_mla_prefill_k_end,
+            flash_mla_safe_pages,
         )
     else:
+        if idx_q is None or idx_k_cache is None:
+            raise ValueError("MiniMax index producer requires index Q/K")
         idx_o, topk_idx = flash_prefill_with_topk_index(
             q=idx_q,
             k_cache=idx_k_cache,
@@ -283,13 +322,17 @@ def minimax_sparse_prefill(
             sort_topk_ids=not (use_exact_grouped_main and fused_topk_union),
         )
     # Step 2: Reduce topk idx if num_idx_heads > num_kv_heads
-    num_idx_heads = idx_q.shape[1]
-    num_kv_heads = k_cache.shape[1]
-    idx_group_size = num_idx_heads // num_kv_heads
-    if idx_group_size > 1:
-        topk_idx = topk_index_reduce(
-            topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
-        )
+    if precomputed_topk_idx is None:
+        num_idx_heads = idx_q.shape[1]
+        num_kv_heads = k_cache.shape[1]
+        idx_group_size = num_idx_heads // num_kv_heads
+        if idx_group_size > 1:
+            topk_idx = topk_index_reduce(
+                topk_idx.view(num_kv_heads, idx_group_size, -1, topk), dim=1
+            )
+    # This is the reusable semantic boundary: exact per-query indices after
+    # index-head reduction and before any main-attention grouping/union.
+    exact_topk_idx = topk_idx
     q_for_main = (
         dcp_group.all_gather(q.contiguous(), dim=1).contiguous()
         if dcp_size > 1
@@ -395,14 +438,14 @@ def minimax_sparse_prefill(
             )
         from .flash_mla_gfx938 import flash_mla_sparse_prefill_main
 
-        exact_topk_idx = (
+        main_exact_topk_idx = (
             per_query_topk_idx if per_query_topk_idx is not None else topk_idx
         )
         o = flash_mla_sparse_prefill_main(
             q=q_for_main,
             k_cache=k_cache,
             v_cache=v_cache,
-            topk_idx=exact_topk_idx,
+            topk_idx=main_exact_topk_idx,
             page_table=flash_mla_page_table,
             cu_seqlens=cu_seqlens,
             seq_lens=seq_lens,
@@ -495,6 +538,8 @@ def minimax_sparse_prefill(
         o = cp_lse_ag_out_rs_mha(
             o, local_lse, dcp_group, use_reduce_scatter=True
         )
+    if return_topk_idx:
+        return idx_o, o, exact_topk_idx
     return idx_o, o
 
 
@@ -544,7 +589,11 @@ def minimax_sparse_decode(
     dcp_rank: int = 0,
     dcp_group=None,
     verify_group_size: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_topk_idx: bool = False,
+) -> Union[
+    Tuple[torch.Tensor, torch.Tensor],
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+]:
     k_cache = _flatten_main_kv_cache(k_cache)
     v_cache = _flatten_main_kv_cache(v_cache)
     if dcp_size > 1:
@@ -679,6 +728,7 @@ def minimax_sparse_decode(
                 q_scale=q_scale,
                 k_scale=k_scale,
                 v_scale=v_scale,
+                verify_group_size=verify_group_size,
             )
         elif use_msa and sink is None:
             from .msa import MSAUnavailableError, msa_sparse_decode_main
@@ -719,6 +769,10 @@ def minimax_sparse_decode(
                     dcp_size=dcp_size,
                     dcp_rank=dcp_rank,
                     return_lse=dcp_size > 1,
+                    verify_group_size=verify_group_size,
+                    use_multi_q_main=(
+                        envs.SGLANG_OPT_USE_MINIMAX_MULTI_Q_VERIFY_MAIN.get()
+                    ),
                 )
         else:
             o = flash_decode_with_gqa_share_sparse(
@@ -738,10 +792,16 @@ def minimax_sparse_decode(
                 dcp_size=dcp_size,
                 dcp_rank=dcp_rank,
                 return_lse=dcp_size > 1,
+                verify_group_size=verify_group_size,
+                use_multi_q_main=(
+                    envs.SGLANG_OPT_USE_MINIMAX_MULTI_Q_VERIFY_MAIN.get()
+                ),
             )
         if dcp_size > 1:
             o, local_lse = o
             o = cp_lse_ag_out_rs_mha(
                 o, local_lse, dcp_group, use_reduce_scatter=True
             )
+    if return_topk_idx:
+        return idx_o, o, topk_idx
     return idx_o, o

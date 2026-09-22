@@ -561,6 +561,8 @@ def _gqa_share_sparse_fwd_kernel(
     # per-tensor KV dequant scales (1.0 when the cache is unit-scaled)
     k_scale,
     v_scale,
+    # Scale softmax probabilities into the useful e4m3 range before FP8 PV.
+    p_scale,
     # stride
     stride_qn,
     stride_qh,
@@ -600,6 +602,7 @@ def _gqa_share_sparse_fwd_kernel(
     HAS_SINK: tl.constexpr,
     USE_TMA: tl.constexpr,
     IS_FP8: tl.constexpr,
+    FP8_PV: tl.constexpr,
     DCP_SIZE: tl.constexpr,
     DCP_RANK: tl.constexpr,
     STORE_LSE: tl.constexpr,
@@ -796,9 +799,12 @@ def _gqa_share_sparse_fwd_kernel(
                 # `p.to(v.dtype)` keeps P in the compute dtype), no-op with fp8
                 # Q where P is quantized to e4m3 for the fp8 PV MMA — the same
                 # accuracy contract as fmha_sm100's fp8 kernel.
-                v = v.to(q.dtype)
-            p = p.to(v.dtype)
-            updated_acc_o += tl.dot(p, v) * v_scale
+                if FP8_PV:
+                    v = v.to(q.dtype)
+                else:
+                    v = v.to(tl.bfloat16)
+            p = (p * p_scale).to(v.dtype)
+            updated_acc_o += tl.dot(p, v) * (v_scale / p_scale)
             # update statistics
             if DCP_SIZE > 1 or PER_QUERY_MASK:
                 lse_sum = tl.where(
@@ -880,6 +886,19 @@ def flash_prefill_with_gqa_share_sparse(
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="prefill")
     k_scale = unit_scale(k_scale)
     v_scale = unit_scale(v_scale)
+    fp8_pv = q.dtype == torch.float8_e4m3fn and os.environ.get(
+        "SGLANG_M3_TRITON_FP8_PREFILL_BF16_PV", "0"
+    ) not in ("1", "true", "True")
+    p_scale = (
+        float(os.environ.get("SGLANG_M3_TRITON_FP8_P_SCALE", "448"))
+        if fp8_pv
+        else 1.0
+    )
+    if fp8_pv and not (0.0 < p_scale <= 448.0):
+        raise ValueError(
+            "SGLANG_M3_TRITON_FP8_P_SCALE must be in (0, 448] for e4m3fn, "
+            f"got {p_scale}"
+        )
     assert block_size_q in {1, 2, 4, 8, 16, 32, 64}
     assert block_size_k in {16, 32, 64, 128}
     # shape
@@ -961,6 +980,7 @@ def flash_prefill_with_gqa_share_sparse(
         sm_scale,
         k_scale,
         v_scale,
+        p_scale,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -991,6 +1011,7 @@ def flash_prefill_with_gqa_share_sparse(
         BLOCK_SIZE_K=BLOCK_SIZE_K,
         USE_TMA=use_tma,
         IS_FP8=is_fp8,
+        FP8_PV=fp8_pv,
         DCP_SIZE=dcp_size,
         DCP_RANK=dcp_rank,
         STORE_LSE=return_lse,

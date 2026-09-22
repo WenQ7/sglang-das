@@ -237,11 +237,10 @@ def fp8_lm_head_top1_fused(
     output_indices = torch.empty(
         (m,), dtype=torch.int32, device=hidden_states.device
     )
-    block_m = triton.next_power_of_2(m)
-    if block_m > 8:
-        raise ValueError(
-            f"fused draft LM-head is intended for M <= 8, got M={m}"
-        )
+    # Keep each program small enough for the register-resident vocabulary
+    # reduction, and extend the M grid for target-verify batches.  Draft uses
+    # M<=8, while DP8 vocab parallelism commonly gathers M=32..256 rows.
+    block_m = min(8, triton.next_power_of_2(m))
 
     _fp8_lm_head_top1_partials_kernel[(triton.cdiv(m, block_m), num_n_blocks)](
         qinput,
@@ -286,9 +285,15 @@ def bf16_lm_head_top1_fused(
     *,
     valid_vocab_size: int,
     block_n: int = 128,
-    block_k: int = 256,
+    block_k: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """BF16 LM-head GEMM + Top-1 without materializing local logits."""
+    """BF16 LM-head GEMM + Top-1 without materializing local logits.
+
+    The target verifier has a small, discrete set of CUDA-graph shapes.  The
+    gfx938 MiniMax-M3 LM head is fastest with K=128 for M<=16 and K=64 for
+    M>=32.  Keep an explicit ``block_k`` override for tuning/tests, but use the
+    measured shape dispatch by default.
+    """
     if hidden_states.ndim != 2 or weight.ndim != 2:
         raise ValueError("hidden_states and weight must both be 2-D")
     if hidden_states.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
@@ -309,9 +314,12 @@ def bf16_lm_head_top1_fused(
             torch.empty((0,), dtype=torch.float32, device=hidden_states.device),
             torch.empty((0,), dtype=torch.int32, device=hidden_states.device),
         )
-    block_m = triton.next_power_of_2(m)
-    if block_m > 8:
-        raise ValueError(f"fused draft LM-head is intended for M <= 8, got M={m}")
+    if block_k is None:
+        block_k = 64 if m >= 32 else 128
+    # The target verifier commonly has M=local_batch*verify_width (for the
+    # MiniMax winner, 4*4=16). Cap each program at eight rows and extend the M
+    # grid rather than materializing full-vocabulary logits for larger M.
+    block_m = min(8, triton.next_power_of_2(m))
     num_n_blocks = triton.cdiv(valid_vocab_size, block_n)
     partial_values = torch.empty(
         (m, num_n_blocks), dtype=torch.float32, device=hidden_states.device

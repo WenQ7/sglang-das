@@ -28,6 +28,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.configs.model_config import (
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
+    minimax_sparse_layer_skips_topk,
 )
 from sglang.srt.distributed import (
     get_pp_group,
@@ -59,12 +60,16 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessor,
+    is_target_verify_greedy_top1_eligible,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
+    has_per_rank_fused_shared_slots,
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -114,7 +119,23 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+
+
 _device_sm = get_device_sm()
+
+
+def _minimax_moe_num_physical_experts(
+    num_routed_experts: int,
+    num_fused_shared_experts: int,
+    ep_size: int,
+    num_redundant_experts: int,
+    use_per_rank_shared_slots: bool,
+) -> int:
+    """Return the global physical expert-id space consumed by the MoE runner."""
+    num_shared_slots = num_fused_shared_experts * (
+        ep_size if use_per_rank_shared_slots else 1
+    )
+    return num_routed_experts + num_redundant_experts + num_shared_slots
 
 # MiniMax-M3 channel-FP8 checkpoints launch qkv_proj and index_qkv_proj with
 # the same input on every sparse-attention layer.  LightOp keeps both weights
@@ -425,6 +446,28 @@ class MiniMaxM3MoE(nn.Module):
         self.num_fused_shared_experts = (
             0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
         )
+        use_per_rank_shared_slots = has_per_rank_fused_shared_slots(
+            self.num_fused_shared_experts
+        )
+        local_shared_without_dispatch = bool(
+            self.num_fused_shared_experts
+            and get_moe_a2a_backend().is_deepep()
+            and parallel.moe_ep_size > 1
+        )
+        num_dispatch_experts = (
+            config.num_local_experts + get_exec().moe.ep_num_redundant_experts
+        )
+        # DeepEP keeps its native routed-only global ID space.  The shared
+        # checkpoint weights occupy one additional local runner slot per rank,
+        # but shared rows are injected only after A2A so the vendor LL layout
+        # remains E16/rank rather than the unsupported E17/rank layout.
+        num_physical_experts = _minimax_moe_num_physical_experts(
+            config.num_local_experts,
+            self.num_fused_shared_experts,
+            parallel.moe_ep_size,
+            get_exec().moe.ep_num_redundant_experts,
+            use_per_rank_shared_slots,
+        )
 
         if self.tp_size > config.num_local_experts:
             raise ValueError(
@@ -444,11 +487,22 @@ class MiniMaxM3MoE(nn.Module):
             self.e_score_correction_bias = None
 
         self.experts = get_moe_impl_class(quant_config)(
-            num_experts=config.num_local_experts
-            + self.num_fused_shared_experts
-            + get_exec().moe.ep_num_redundant_experts,
+            num_experts=num_physical_experts,
             num_fused_shared_experts=self.num_fused_shared_experts,
-            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+            top_k=(
+                config.num_experts_per_tok
+                if local_shared_without_dispatch
+                else config.num_experts_per_tok + self.num_fused_shared_experts
+            ),
+            num_dispatch_experts=(
+                num_dispatch_experts if local_shared_without_dispatch else None
+            ),
+            num_dispatch_local_experts=(
+                num_dispatch_experts // parallel.moe_ep_size
+                if local_shared_without_dispatch
+                else None
+            ),
+            local_shared_experts_without_dispatch=local_shared_without_dispatch,
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             layer_id=layer_id,
@@ -462,12 +516,20 @@ class MiniMaxM3MoE(nn.Module):
             gate_up_interleaved=False,
         )
         self.topk = TopK(
-            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+            top_k=(
+                config.num_experts_per_tok
+                if local_shared_without_dispatch
+                else config.num_experts_per_tok + self.num_fused_shared_experts
+            ),
             renormalize=True,
             layer_id=layer_id,
             scoring_func=config.scoring_func,
             correction_bias=self.e_score_correction_bias,
-            num_fused_shared_experts=self.num_fused_shared_experts,
+            num_fused_shared_experts=(
+                0
+                if local_shared_without_dispatch
+                else self.num_fused_shared_experts
+            ),
             routed_scaling_factor=self.routed_scaling_factor,
             apply_routed_scaling_factor_on_output=True,
         )
@@ -539,6 +601,11 @@ class MiniMaxM3MoE(nn.Module):
         )
 
         self.layer_id = layer_id
+        self._moe_profile_markers = os.environ.get(
+            "SGLANG_MINIMAX_MOE_PROFILE_MARKERS", "0"
+        ).lower() in ("1", "true", "yes")
+        self._shared_profile_name = f"minimax_moe.shared_expert.layer_{layer_id}"
+        self._routed_profile_name = f"minimax_moe.routed_deepep.layer_{layer_id}"
 
         if get_moe_a2a_backend().is_deepep():
             self.ep_size = get_parallel().moe_ep_size
@@ -669,7 +736,13 @@ class MiniMaxM3MoE(nn.Module):
 
         # DeepEP returns the complete per-token routed result (no TP all-reduce here);
         # shared experts are replicated (tp_size=1), so both add directly.
-        final_hidden_states = self.experts(hidden_states, topk_output)
+        routed_scope = (
+            torch.profiler.record_function(self._routed_profile_name)
+            if self._moe_profile_markers
+            else nullcontext()
+        )
+        with routed_scope:
+            final_hidden_states = self.experts(hidden_states, topk_output)
 
         if enable_npu_dual_stream:
             wait_share_stream()
@@ -718,7 +791,13 @@ class MiniMaxM3MoE(nn.Module):
 
     def _forward_shared_experts(self, hidden_states: torch.Tensor):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
-            return self.shared_experts(hidden_states)
+            shared_scope = (
+                torch.profiler.record_function(self._shared_profile_name)
+                if self._moe_profile_markers
+                else nullcontext()
+            )
+            with shared_scope:
+                return self.shared_experts(hidden_states)
         else:
             return None
 
@@ -734,9 +813,44 @@ class MiniMaxM3Attention(nn.Module):
         disable_index_value: bool = False,
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.is_sparse_attention_layer = is_sparse_attention_layer
         self.disable_index_value = is_sparse_attention_layer and disable_index_value
+        self.index_topk_freq = int(
+            os.environ.get("SGLANG_MINIMAX_INDEX_TOPK_FREQ", "1")
+        )
+        self.index_topk_mode = os.environ.get(
+            "SGLANG_MINIMAX_INDEX_TOPK_MODE", "off"
+        ).lower()
+        if self.index_topk_mode not in ("off", "shadow", "reuse"):
+            raise ValueError(
+                "SGLANG_MINIMAX_INDEX_TOPK_MODE must be off, shadow, or reuse, "
+                f"got {self.index_topk_mode!r}"
+            )
+        sparse_cfg = (
+            config.sparse_attention_config if is_sparse_attention_layer else None
+        )
+        self.skip_index_topk = bool(
+            sparse_cfg is not None
+            and self.index_topk_mode != "off"
+            and minimax_sparse_layer_skips_topk(
+                sparse_cfg, layer_id, self.index_topk_freq
+            )
+        )
+        self.elide_index_producer = bool(
+            self.skip_index_topk
+            and self.index_topk_mode == "reuse"
+            and os.environ.get(
+                "SGLANG_MINIMAX_INDEX_TOPK_ELIDE_PRODUCER", "0"
+            )
+            in ("1", "true", "True")
+        )
+        if self.elide_index_producer and not self.disable_index_value:
+            raise ValueError(
+                "MiniMax index producer elision requires sparse index value "
+                f"to be disabled on layer {layer_id}"
+            )
 
         attn_tp_rank = get_parallel().attn_tp_rank
         attn_tp_size = get_parallel().attn_tp_size
@@ -1084,6 +1198,11 @@ class MiniMaxM3Attention(nn.Module):
     def maybe_build_fused_qkv_index(self) -> bool:
         if not self._fuse_qkv_index_enabled or self._fused_qkv_index is not None:
             return False
+        # Prefill reuse layers need a QKV-only projection so the unused index
+        # producer can actually be removed. Keep qkv_proj/index_qkv_proj as
+        # separate modules; decode and verify still execute both normally.
+        if self.elide_index_producer:
+            return False
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
         qp, ip = self.qkv_proj, self.index_qkv_proj
@@ -1367,6 +1486,7 @@ class MiniMaxM3Attention(nn.Module):
                 q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
                 idx_qkv = fused_out[:, self._fused_main_size :]
                 idx_q, idx_k, idx_v = self._split_index_qkv(idx_qkv)
+                self._record_kv_calibration(q, k, v, forward_batch)
                 inner_state = (q, k, v, idx_q, idx_k, idx_v, forward_batch)
                 return None, forward_batch, inner_state
         else:
@@ -1395,6 +1515,16 @@ class MiniMaxM3Attention(nn.Module):
             main_qk_already_normed = False
 
         if self.is_sparse_attention_layer:
+            elide_index_producer = (
+                self.elide_index_producer
+                and forward_batch.forward_mode.is_extend_without_speculative()
+            )
+            if elide_index_producer:
+                if not main_qk_already_normed:
+                    q, k = self._qk_norm_rope(positions, q, k)
+                self._record_kv_calibration(q, k, v, forward_batch)
+                inner_state = (q, k, v, None, None, None, forward_batch)
+                return None, forward_batch, inner_state
             if fused_out is not None:
                 idx_qkv = fused_out[:, self._fused_main_size :]
             else:
@@ -1437,7 +1567,29 @@ class MiniMaxM3Attention(nn.Module):
             if not main_qk_already_normed:
                 q, k = self._qk_norm_rope(positions, q, k)
             inner_state = (q, k, v, forward_batch)
+        self._record_kv_calibration(q, k, v, forward_batch)
         return None, forward_batch, inner_state
+
+    def _record_kv_calibration(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        if not os.environ.get("SGLANG_MINIMAX_KV_CALIBRATION_DIR"):
+            return
+        # CUDA/HIP graph capture executes synthetic buffers and must never
+        # contaminate real-activation calibration statistics.
+        if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
+            return
+        from sglang.srt.models.minimax_kv_calibration import (
+            record_minimax_kv_activations,
+        )
+
+        record_minimax_kv_activations(
+            self.layer_id, q, k, v, forward_batch.forward_mode
+        )
 
     def forward_core(self, intermediate_state):
         _, _, inner_state = intermediate_state
@@ -1447,8 +1599,12 @@ class MiniMaxM3Attention(nn.Module):
             q = q.view(q.shape[0], self.num_heads, self.head_dim)
             k = k.view(k.shape[0], self.num_kv_heads, self.head_dim)
             v = v.view(v.shape[0], self.num_kv_heads, self.head_dim)
-            idx_q = idx_q.reshape(idx_q.shape[0], self.num_idx_heads, self.idx_head_dim)
-            idx_k = idx_k.reshape(idx_k.shape[0], 1, self.idx_head_dim)
+            if idx_q is not None:
+                idx_q = idx_q.reshape(
+                    idx_q.shape[0], self.num_idx_heads, self.idx_head_dim
+                )
+            if idx_k is not None:
+                idx_k = idx_k.reshape(idx_k.shape[0], 1, self.idx_head_dim)
             if idx_v is not None:
                 idx_v = idx_v.reshape(idx_v.shape[0], 1, self.idx_head_dim)
             idx_o, attn_output = self.attn(
@@ -2030,6 +2186,173 @@ class MiniMaxM3Model(nn.Module):
         return hidden_states, aux_hidden_states
 
 
+_TARGET_LM_HEAD_TOP1_BACKENDS = {
+    "triton_bf16_fused",
+    "lightop",
+    "lightop_fp8",
+    "triton_fused",
+    "triton_fp8_fused",
+}
+
+
+def init_minimax_target_lm_head_top1(module: nn.Module) -> None:
+    """Install target-verify Top-1 state on text and multimodal wrappers."""
+    module.use_target_verify_lm_head_top1 = (
+        module.pp_group.is_last_rank
+        and envs.SGLANG_OPT_USE_EAGLE3_TARGET_LM_HEAD_TOP1.get()
+    )
+    module.target_verify_lm_head_top1_shadow = (
+        module.pp_group.is_last_rank
+        and envs.SGLANG_EAGLE3_TARGET_LM_HEAD_TOP1_SHADOW.get()
+    )
+    module.target_verify_lm_head_top1_min_rows = (
+        envs.SGLANG_EAGLE3_TARGET_LM_HEAD_TOP1_MIN_ROWS.get()
+    )
+    module.target_verify_lm_head_top1_backend = (
+        envs.SGLANG_EAGLE3_TARGET_LM_HEAD_TOP1_BACKEND.get()
+    )
+    module.target_verify_lm_head_vocab_tp = (
+        envs.SGLANG_EAGLE3_TARGET_LM_HEAD_VOCAB_TP.get()
+    )
+    if module.target_verify_lm_head_top1_min_rows < 1:
+        raise ValueError(
+            "SGLANG_EAGLE3_TARGET_LM_HEAD_TOP1_MIN_ROWS must be >= 1"
+        )
+    if module.target_verify_lm_head_top1_backend not in _TARGET_LM_HEAD_TOP1_BACKENDS:
+        raise ValueError(
+            "SGLANG_EAGLE3_TARGET_LM_HEAD_TOP1_BACKEND must be one of "
+            f"{sorted(_TARGET_LM_HEAD_TOP1_BACKENDS)}, got "
+            f"{module.target_verify_lm_head_top1_backend!r}"
+        )
+    if (
+        module.target_verify_lm_head_vocab_tp
+        and module.pp_group.is_last_rank
+        and getattr(module.lm_head, "tp_size", None) != 1
+    ):
+        raise ValueError(
+            "SGLANG_EAGLE3_TARGET_LM_HEAD_VOCAB_TP requires the ordinary "
+            "LM head to stay replicated; enable DP LM-head"
+        )
+    module.register_buffer("_target_lm_head_fp8_weight", None, persistent=False)
+    module.register_buffer("_target_lm_head_fp8_scale", None, persistent=False)
+
+    if module.use_target_verify_lm_head_top1:
+        log_info_on_rank0(
+            logger,
+            "MiniMax-M3 target verify uses direct LM-head Top-1 "
+            f"(backend={module.target_verify_lm_head_top1_backend}, "
+            f"min_rows={module.target_verify_lm_head_top1_min_rows}, "
+            f"temporary_vocab_tp={module.target_verify_lm_head_vocab_tp}).",
+        )
+    if module.target_verify_lm_head_top1_shadow:
+        log_info_on_rank0(
+            logger,
+            "MiniMax-M3 target verify Top-1 shadow validation is enabled; "
+            "ordinary BF16 logits remain authoritative.",
+        )
+
+
+def post_load_minimax_target_lm_head_top1(module: nn.Module) -> None:
+    """Build an optional FP8 copy of the local vocab shard after loading."""
+    if not (
+        module.use_target_verify_lm_head_top1
+        or module.target_verify_lm_head_top1_shadow
+    ):
+        return
+    if module.target_verify_lm_head_top1_backend == "triton_bf16_fused":
+        return
+    if module._target_lm_head_fp8_weight is not None:
+        return
+    weight = getattr(module.lm_head, "weight", None)
+    if weight is None or weight.dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError(
+            "target FP8 Top-1 requires an unquantized FP16/BF16 LM-head, got "
+            f"{getattr(weight, 'dtype', None)}"
+        )
+    if getattr(module.lm_head, "bias", None) is not None:
+        raise RuntimeError("target FP8 Top-1 does not support an LM-head bias")
+    if module.lm_head.num_embeddings != module.lm_head.org_vocab_size:
+        raise RuntimeError("target FP8 Top-1 does not support added vocabulary")
+    from sglang.kernels.ops.speculative.fp8_lm_head_top1 import (
+        quantize_lm_head_weight_fp8_per_channel,
+    )
+
+    weight_to_quantize = weight
+    if module.target_verify_lm_head_vocab_tp:
+        tp_size = get_parallel().tp_size
+        tp_rank = get_parallel().tp_rank
+        if weight.shape[0] % tp_size != 0:
+            raise RuntimeError(
+                "target FP8 temporary vocab TP requires divisible weight rows"
+            )
+        rows_per_rank = weight.shape[0] // tp_size
+        weight_to_quantize = weight[
+            tp_rank * rows_per_rank : (tp_rank + 1) * rows_per_rank
+        ]
+    module._target_lm_head_fp8_weight, module._target_lm_head_fp8_scale = (
+        quantize_lm_head_weight_fp8_per_channel(weight_to_quantize)
+    )
+    log_info_on_rank0(
+        logger,
+        "MiniMax-M3 target LM-head local vocab shard was quantized to "
+        f"per-channel FP8 ({tuple(weight_to_quantize.shape)}).",
+    )
+
+
+def maybe_forward_minimax_target_lm_head_top1(
+    module: nn.Module,
+    input_ids: torch.Tensor,
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+    aux_hidden_states,
+):
+    """Return the target Top-1 output, or None for the ordinary logits path."""
+    if not forward_batch.forward_mode.is_target_verify():
+        return None
+    if not (
+        module.use_target_verify_lm_head_top1
+        or module.target_verify_lm_head_top1_shadow
+    ):
+        return None
+    # Direct Top-1 deliberately omits the vocabulary logits required by
+    # sampling modifiers.  Unsupported and mixed batches transparently use the
+    # ordinary logits processor instead of surfacing a request-time error.
+    if not is_target_verify_greedy_top1_eligible(forward_batch):
+        return None
+    candidate = module.logits_processor.forward_target_verify_top1(
+        input_ids,
+        hidden_states,
+        module.lm_head,
+        forward_batch,
+        aux_hidden_states,
+        fused_min_rows=(
+            1
+            if module.target_verify_lm_head_top1_shadow
+            else module.target_verify_lm_head_top1_min_rows
+        ),
+        backend=module.target_verify_lm_head_top1_backend,
+        fp8_weight=module._target_lm_head_fp8_weight,
+        fp8_weight_scale=module._target_lm_head_fp8_scale,
+        vocab_tp=module.target_verify_lm_head_vocab_tp,
+    )
+    if not module.target_verify_lm_head_top1_shadow:
+        return candidate
+
+    baseline = module.logits_processor(
+        input_ids,
+        hidden_states,
+        module.lm_head,
+        forward_batch,
+        aux_hidden_states,
+    )
+    baseline_ids = baseline.next_token_logits.argmax(dim=-1, keepdim=True)
+    torch._assert_async(
+        (baseline_ids == candidate.target_topk_index).all(),
+        "MiniMax-M3 target LM-head Top-1 shadow mismatch",
+    )
+    return baseline
+
+
 class MiniMaxM3SparseForCausalLM(nn.Module):
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={".block_sparse_moe.": ".mlp."}
@@ -2073,6 +2396,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             self.lm_head = PPMissingLayer()
 
         self.capture_aux_hidden_states = False
+        init_minimax_target_lm_head_top1(self)
 
     def get_input_embeddings(self):
         return self.model.get_input_embeddings()
@@ -2089,22 +2413,26 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 "in ModelOpt mixed-precision checkpoints."
             )
         # Keep the conservative platform checks below as the automatic policy,
-        # but honor the existing explicit override for validated EP1
-        # deployments.  Under standard EP8 the routed experts are MoE-TP1,
-        # whereas the shared MLP must stay TP8-sharded. A single grouped-MoE
-        # expert shape cannot represent both layouts; replicating a full shared
-        # expert on every rank would multiply its contribution in the TP8 sum.
+        # but honor the explicit override for validated EP1 and DeepEP
+        # deployments. Standard EP still performs a TP reduction, so putting a
+        # full shared expert on every rank would multiply its contribution.
+        # DeepEP keeps the shared rows local and appends them to the grouped
+        # GEMM only after routed A2A.
         if get_exec().moe.enforce_shared_experts_fusion:
             if hf_config.n_shared_experts != 1:
                 raise ValueError(
                     "MiniMax-M3 shared-experts fusion expects exactly one shared "
                     f"expert, but got n_shared_experts={hf_config.n_shared_experts}."
                 )
-            if get_parallel().moe_ep_size > 1:
+            if (
+                get_parallel().moe_ep_size > 1
+                and not get_moe_a2a_backend().is_deepep()
+            ):
                 return (
                     "MiniMax-M3 fused shared expert is invalid with expert "
-                    "parallelism: keep it TP-sharded and use the standard-EP "
-                    "shared-expert overlap path instead."
+                    "parallelism unless DeepEP per-rank shared slots are used: "
+                    "keep it TP-sharded and use the standard-EP shared-expert "
+                    "overlap path instead."
                 )
             return None
         if not _is_cuda:
@@ -2202,6 +2530,15 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
+            target_top1_output = maybe_forward_minimax_target_lm_head_top1(
+                self,
+                input_ids,
+                hidden_states,
+                forward_batch,
+                aux_hidden_states,
+            )
+            if target_top1_output is not None:
+                return target_top1_output
             return self.logits_processor(
                 input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
             )
@@ -2340,6 +2677,7 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         # Run before the loader's process pass: the raw fp8 weight + uint8 scale are
         # final here (mxfp8 post-process only derives the packed scale, not these).
         build_minimax_fused_qkv_index(self)
+        post_load_minimax_target_lm_head_top1(self)
         return loaded_params
 
     @classmethod

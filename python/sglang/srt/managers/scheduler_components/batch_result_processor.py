@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -71,6 +73,9 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+_trace_spec_acceptance_steps = os.environ.get(
+    "SGLANG_SPEC_ACCEPTANCE_STEP_TRACE", "0"
+).lower() in ("1", "true", "yes")
 
 
 @dataclass(kw_only=True, slots=True, frozen=True)
@@ -637,6 +642,22 @@ class SchedulerBatchResultProcessor:
         accept_lens = result.accept_lens.tolist()
         result.num_correct_drafts = sum(accept_lens) - len(batch.reqs)
         result.num_correct_drafts_per_req_cpu = [x - 1 for x in accept_lens]
+
+        if _trace_spec_acceptance_steps:
+            logger.info(
+                "[SpecAcceptanceStep] %s",
+                json.dumps(
+                    {
+                        "request_ids": [str(req.rid) for req in batch.reqs],
+                        "accepted_drafts": result.num_correct_drafts_per_req_cpu,
+                        "accepted_tokens_with_bonus": accept_lens,
+                        "draft_tokens_per_request": int(
+                            result.speculative_num_draft_tokens or 0
+                        )
+                        - 1,
+                    }
+                ),
+            )
 
         block_accept_lens = (
             result.block_accept_lens.tolist()

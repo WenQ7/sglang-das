@@ -33,6 +33,9 @@ from sglang.srt.models.minimax_m3 import (
     MiniMaxM3SparseForCausalLM,
     build_minimax_fused_qkv_index,
     get_spec_layer_idx_from_weight_name,
+    init_minimax_target_lm_head_top1,
+    maybe_forward_minimax_target_lm_head_top1,
+    post_load_minimax_target_lm_head_top1,
 )
 from sglang.srt.models.minimax_vl_common import (
     CLIPVisionConfig,
@@ -130,6 +133,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
 
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
+        init_minimax_target_lm_head_top1(self)
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
@@ -262,6 +266,15 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank and not get_embedding:
+            target_top1_output = maybe_forward_minimax_target_lm_head_top1(
+                self,
+                input_ids,
+                hidden_states,
+                forward_batch,
+                aux_hidden_states,
+            )
+            if target_top1_output is not None:
+                return target_top1_output
             return self.logits_processor(
                 input_ids,
                 hidden_states,
@@ -339,6 +352,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         merge_vit_qkv_weights(vit_qkv_weights, vit_qkv_biases, params_dict)
 
         build_minimax_fused_qkv_index(self)
+        post_load_minimax_target_lm_head_top1(self)
 
     def _load_llm_weight(
         self,

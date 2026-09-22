@@ -161,12 +161,22 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
         or a2a_backend.is_nixl()
         or a2a_backend.is_pplx()
     ):
+        num_dispatch_experts = (
+            moe_runner_config.num_dispatch_experts
+            if moe_runner_config.num_dispatch_experts is not None
+            else moe_runner_config.num_experts
+        )
+        num_dispatch_local_experts = (
+            moe_runner_config.num_dispatch_local_experts
+            if moe_runner_config.num_dispatch_local_experts is not None
+            else moe_runner_config.num_local_experts
+        )
         return MaybeTboDeepEPDispatcher(
             group=_get_deepep_comm_group(a2a_backend),
             router_topk=moe_runner_config.top_k,
             permute_fusion=True,
-            num_experts=moe_runner_config.num_experts,
-            num_local_experts=moe_runner_config.num_local_experts,
+            num_experts=num_dispatch_experts,
+            num_local_experts=num_dispatch_local_experts,
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
             deepep_mode=get_deepep_mode(),
@@ -267,6 +277,9 @@ class FusedMoE(torch.nn.Module):
         routing_method_type: Optional[RoutingMethodType] = None,
         is_gated: bool = True,
         gate_up_interleaved: bool = True,
+        num_dispatch_experts: Optional[int] = None,
+        num_dispatch_local_experts: Optional[int] = None,
+        local_shared_experts_without_dispatch: bool = False,
     ):
         super().__init__()
         if params_dtype is None:
@@ -352,6 +365,9 @@ class FusedMoE(torch.nn.Module):
         self.moe_runner_config = MoeRunnerConfig(
             num_experts=num_experts,
             num_local_experts=self.num_local_experts,
+            num_dispatch_experts=num_dispatch_experts,
+            num_dispatch_local_experts=num_dispatch_local_experts,
+            local_shared_experts_without_dispatch=local_shared_experts_without_dispatch,
             hidden_size=hidden_size,
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             layer_id=layer_id,

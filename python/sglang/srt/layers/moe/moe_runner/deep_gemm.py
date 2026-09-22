@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
@@ -302,11 +302,44 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                     "HCU DeepGEMM requires channel-FP8 weights packed during "
                     "process_weights_after_loading"
                 )
+            # Local-only shared fusion is a low-latency optimization.  Normal
+            # DeepEP keeps its routed contiguous layout; an unused seventeenth
+            # weight group makes the HCU grouped launcher see M=0 and can drive
+            # hipBLASLt into an invalid problem.  Restrict normal-mode weights
+            # to the routed groups; the shared branch is evaluated separately
+            # by DeepEPMoE for prefill/extend.
+            hcu_quant_info = quant_info
+            if (
+                self.config.local_shared_experts_without_dispatch
+                and not runner_input.use_masked_gemm
+            ):
+                num_routed = self.config.num_dispatch_local_experts
+                if num_routed is None:
+                    raise RuntimeError(
+                        "Local shared grouping requires num_dispatch_local_experts."
+                    )
+                hcu_quant_info = replace(
+                    quant_info,
+                    w13_weight=quant_info.w13_weight[:num_routed],
+                    w2_weight=quant_info.w2_weight[:num_routed],
+                    w13_scale=quant_info.w13_scale[:num_routed],
+                    w2_scale=quant_info.w2_scale[:num_routed],
+                    logical_w13_shape=(
+                        num_routed,
+                        *quant_info.logical_w13_shape[1:],
+                    ),
+                    logical_w2_shape=(
+                        num_routed,
+                        *quant_info.logical_w2_shape[1:],
+                    ),
+                )
             hidden_states = (
-                self._run_hcu_masked_gemm(runner_input, quant_info, running_state)
+                self._run_hcu_masked_gemm(
+                    runner_input, hcu_quant_info, running_state
+                )
                 if runner_input.use_masked_gemm
                 else self._run_hcu_contiguous_gemm(
-                    runner_input, quant_info, running_state
+                    runner_input, hcu_quant_info, running_state
                 )
             )
             return DeepGemmRunnerOutput(hidden_states=hidden_states)
@@ -1328,9 +1361,12 @@ def pre_permute_deepep_ll_to_deep_gemm(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepGemmRunnerInput:
-    hidden_states, hidden_states_scale, topk_ids, topk_weights, masked_m, expected_m = (
-        dispatch_output
-    )
+    hidden_states = dispatch_output.hidden_states
+    hidden_states_scale = dispatch_output.hidden_states_scale
+    topk_ids = dispatch_output.topk_ids
+    topk_weights = dispatch_output.topk_weights
+    masked_m = dispatch_output.masked_m
+    expected_m = dispatch_output.expected_m
 
     running_state["topk_ids"] = topk_ids
     running_state["topk_weights"] = topk_weights
@@ -1339,6 +1375,9 @@ def pre_permute_deepep_ll_to_deep_gemm(
     running_state["hidden_states_device"] = hidden_states.device
     # DeepEP-LL FP8 dispatch quantises activations at a fixed 128 block, not the checkpoint block_shape.
     running_state["mxfp8_act_gran_k"] = 128
+    running_state["local_shared_rows"] = getattr(
+        dispatch_output, "local_shared_rows", 0
+    )
 
     return DeepGemmRunnerInput(
         hidden_states=hidden_states,
@@ -1356,7 +1395,20 @@ def post_permute_deep_gemm_to_deepep_ll(
     runner_config: MoeRunnerConfig,
     running_state: dict,
 ) -> DeepEPLLCombineInput:
-    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPLLCombineInput
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPLLCombineInput,
+        DeepEPLLLocalSharedCombineInput,
+    )
+
+    local_shared_rows = running_state.get("local_shared_rows", 0)
+    if local_shared_rows:
+        hidden_states = runner_output.hidden_states
+        return DeepEPLLLocalSharedCombineInput(
+            hidden_states=hidden_states[:-1],
+            topk_ids=running_state["topk_ids"],
+            topk_weights=running_state["topk_weights"],
+            local_shared_output=hidden_states[-1, :local_shared_rows],
+        )
 
     return DeepEPLLCombineInput(
         hidden_states=runner_output.hidden_states,
@@ -1374,17 +1426,21 @@ def pre_permute_deepep_normal_to_deep_gemm(
 ) -> DeepGemmRunnerInput:
     from sglang.kernels.ops.moe.ep_moe_kernels import ep_scatter
 
-    (
-        hidden_states,
-        hidden_states_scale,
-        topk_ids,
-        topk_weights,
-        num_recv_tokens_per_expert,
-    ) = dispatch_output
+    hidden_states = dispatch_output.hidden_states
+    hidden_states_scale = dispatch_output.hidden_states_scale
+    topk_ids = dispatch_output.topk_ids
+    topk_weights = dispatch_output.topk_weights
+    num_recv_tokens_per_expert = dispatch_output.num_recv_tokens_per_expert
     assert runner_config.activation in ("silu", "situ")
 
     all_tokens = sum(num_recv_tokens_per_expert)
     running_state["all_tokens"] = all_tokens
+    running_state["local_shared_rows"] = getattr(
+        dispatch_output, "local_shared_rows", 0
+    )
+    running_state["routed_recv_rows"] = getattr(
+        dispatch_output, "routed_recv_rows", hidden_states.shape[0]
+    )
 
     K = hidden_states.shape[1]
 
@@ -1479,7 +1535,10 @@ def post_permute_deep_gemm_to_deepep_normal(
     running_state: dict,
 ) -> DeepEPNormalCombineInput:
     from sglang.kernels.ops.moe.ep_moe_kernels import ep_gather
-    from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPNormalCombineInput
+    from sglang.srt.layers.moe.token_dispatcher.deepep import (
+        DeepEPNormalCombineInput,
+        DeepEPNormalLocalSharedCombineInput,
+    )
 
     hidden_states = runner_output.hidden_states
     topk_ids = running_state["topk_ids"]
@@ -1492,6 +1551,18 @@ def post_permute_deep_gemm_to_deepep_normal(
         dtype=torch.bfloat16,
     )
     ep_gather(hidden_states, topk_ids, topk_weights, output_index, gather_out)
+
+    local_shared_rows = running_state.get("local_shared_rows", 0)
+    if local_shared_rows:
+        routed_recv_rows = running_state["routed_recv_rows"]
+        return DeepEPNormalLocalSharedCombineInput(
+            hidden_states=gather_out[:routed_recv_rows],
+            topk_ids=topk_ids[:routed_recv_rows],
+            topk_weights=topk_weights[:routed_recv_rows],
+            local_shared_output=gather_out[
+                routed_recv_rows : routed_recv_rows + local_shared_rows
+            ],
+        )
 
     return DeepEPNormalCombineInput(
         hidden_states=gather_out,

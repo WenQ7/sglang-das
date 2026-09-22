@@ -5,7 +5,10 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
-from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    is_fp8_fnuz,
+    sglang_per_token_group_quant_fp8,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import (
@@ -23,7 +26,11 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import (
 )
 from sglang.srt.layers.moe.token_dispatcher.aiter_utils import should_use_aiter_runner
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
+    DeepEPLLLocalSharedCombineInput,
+    DeepEPLLLocalSharedDispatchOutput,
     DeepEPLLCombineInput,
+    DeepEPNormalLocalSharedCombineInput,
+    DeepEPNormalLocalSharedDispatchOutput,
     DeepEPNormalCombineInput,
 )
 from sglang.srt.layers.moe.topk import (
@@ -302,6 +309,14 @@ class DeepEPMoE(FusedMoE):
         bridge = _get_hcu_ll_graph_bridge(
             dispatch_output.hidden_states, self.params_dtype
         )
+        local_shared_rows = getattr(dispatch_output, "local_shared_rows", 0)
+        if local_shared_rows:
+            return DeepEPLLLocalSharedCombineInput(
+                hidden_states=bridge[:-1],
+                topk_ids=dispatch_output.topk_ids,
+                topk_weights=dispatch_output.topk_weights,
+                local_shared_output=bridge[-1, :local_shared_rows],
+            )
         return DeepEPLLCombineInput(
             hidden_states=bridge,
             topk_ids=dispatch_output.topk_ids,
@@ -356,7 +371,10 @@ class DeepEPMoE(FusedMoE):
         topk_output: TopKOutput,
     ):
 
-        if self.deprecate_flag:
+        if (
+            self.deprecate_flag
+            and not self.moe_runner_config.local_shared_experts_without_dispatch
+        ):
             return super().forward_impl(
                 hidden_states,
                 topk_output,
@@ -365,8 +383,189 @@ class DeepEPMoE(FusedMoE):
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
+        normal_shared_output = None
+        if self.moe_runner_config.local_shared_experts_without_dispatch:
+            from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+            if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+                normal_shared_output = self._run_hcu_local_shared_expert(
+                    hidden_states
+                )
+            else:
+                dispatch_output = self._append_local_shared_group(
+                    dispatch_output, hidden_states
+                )
         combine_input = self.run_moe_core(dispatch_output)
-        return self.dispatcher.combine(combine_input=combine_input)
+        local_shared_output = getattr(combine_input, "local_shared_output", None)
+        if local_shared_output is not None:
+            if isinstance(combine_input, DeepEPLLLocalSharedCombineInput):
+                routed_combine_input = DeepEPLLCombineInput(
+                    combine_input.hidden_states,
+                    combine_input.topk_ids,
+                    combine_input.topk_weights,
+                )
+            else:
+                routed_combine_input = DeepEPNormalCombineInput(
+                    combine_input.hidden_states,
+                    combine_input.topk_ids,
+                    combine_input.topk_weights,
+                )
+            routed_output = self.dispatcher.combine(
+                combine_input=routed_combine_input
+            )
+            return routed_output + local_shared_output
+        routed_output = self.dispatcher.combine(combine_input=combine_input)
+        if normal_shared_output is not None:
+            routed_output = routed_output + normal_shared_output
+        return routed_output
+
+    def _run_hcu_local_shared_expert(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """Evaluate the local shared slot outside normal-mode routed A2A."""
+        from sglang.srt.layers.moe.moe_runner.deep_gemm import (
+            DeepGemmMoeQuantInfo,
+            DeepGemmRunnerInput,
+        )
+
+        if not _should_use_hcu_deepgemm_runner():
+            raise RuntimeError(
+                "DeepEP local shared grouping currently requires HCU DeepGEMM."
+            )
+        local_rows, hidden_size = hidden_states.shape
+        capacity = max(128, ((local_rows + 127) // 128) * 128)
+        shared_q, shared_s = sglang_per_token_group_quant_fp8(
+            hidden_states.contiguous(), hidden_size
+        )
+        packed_q = torch.zeros(
+            (1, capacity, hidden_size),
+            dtype=shared_q.dtype,
+            device=shared_q.device,
+        )
+        packed_s = torch.zeros(
+            (1, capacity, 1),
+            dtype=shared_s.dtype,
+            device=shared_s.device,
+        )
+        packed_q[0, :local_rows].copy_(shared_q)
+        packed_s[0, :local_rows].copy_(shared_s)
+        masked_m = torch.full(
+            (1,), local_rows, dtype=torch.int32, device=hidden_states.device
+        )
+        quant_info = DeepGemmMoeQuantInfo(
+            w13_weight=self.w13_weight[-1:],
+            w2_weight=self.w2_weight[-1:],
+            use_fp8=True,
+            w13_scale=self.w13_weight_scale[-1:],
+            w2_scale=self.w2_weight_scale[-1:],
+            block_shape=None,
+            logical_w13_shape=(
+                1,
+                *self._hcu_deepgemm_logical_w13_shape[1:],
+            ),
+            logical_w2_shape=(
+                1,
+                *self._hcu_deepgemm_logical_w2_shape[1:],
+            ),
+            hcu_packed=True,
+        )
+        runner_input = DeepGemmRunnerInput(
+            hidden_states=packed_q,
+            hidden_states_scale=packed_s,
+            use_masked_gemm=True,
+            masked_m=masked_m,
+            expected_m=max(1, local_rows),
+        )
+        runner_core = self.scheme.runner.runner_core
+        output = runner_core.run(runner_input, quant_info, {}).hidden_states
+        return output[0, :local_rows]
+
+    def _append_local_shared_group(
+        self, dispatch_output: DispatchOutput, hidden_states: torch.Tensor
+    ) -> DispatchOutput:
+        """Append the replicated shared expert only after routed A2A.
+
+        DeepEP low-latency on gfx938 accepts the native E16/rank layout but
+        rejects E17/rank.  Keep its dispatch/handle at E16, then append the
+        local request rows as the seventeenth DeepGEMM group.  Normal mode uses
+        the same semantic split and pads the local group to DeepEP's 256-row
+        expert alignment.
+        """
+        from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
+
+        if self.num_fused_shared_experts != 1:
+            raise RuntimeError(
+                "DeepEP local shared grouping currently requires exactly one "
+                f"shared expert, got {self.num_fused_shared_experts}."
+            )
+        if hidden_states.ndim != 2:
+            raise RuntimeError(
+                "DeepEP local shared grouping expects [M,K] input, got "
+                f"{tuple(hidden_states.shape)}"
+            )
+        local_rows, hidden_size = hidden_states.shape
+        hidden_states = hidden_states.contiguous()
+
+        if DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
+            routed = dispatch_output.hidden_states
+            routed_scale = dispatch_output.hidden_states_scale
+            if routed_scale is None or routed.ndim != 3 or routed_scale.ndim != 3:
+                raise RuntimeError(
+                    "DeepEP local shared grouping requires 3-D FP8 LL activations "
+                    "and scales."
+                )
+            capacity = routed.shape[1]
+            if local_rows > capacity:
+                raise RuntimeError(
+                    f"Local shared rows {local_rows} exceed LL capacity {capacity}."
+                )
+            scale_width = routed_scale.shape[-1]
+            if scale_width <= 0 or hidden_size % scale_width != 0:
+                raise RuntimeError(
+                    "Cannot infer DeepEP LL activation quant group from scale "
+                    f"shape {tuple(routed_scale.shape)} and K={hidden_size}."
+                )
+            shared_q, shared_s = sglang_per_token_group_quant_fp8(
+                hidden_states, hidden_size // scale_width
+            )
+            shared_q_padded = torch.zeros(
+                (1, capacity, hidden_size),
+                dtype=routed.dtype,
+                device=routed.device,
+            )
+            shared_s_padded = torch.zeros(
+                (1, capacity, scale_width),
+                dtype=routed_scale.dtype,
+                device=routed_scale.device,
+            )
+            shared_q_padded[0, :local_rows].copy_(shared_q)
+            shared_s_padded[0, :local_rows].copy_(shared_s)
+            return DeepEPLLLocalSharedDispatchOutput(
+                hidden_states=torch.cat((routed, shared_q_padded), dim=0),
+                hidden_states_scale=torch.cat(
+                    (routed_scale, shared_s_padded), dim=0
+                ),
+                topk_ids=dispatch_output.topk_ids,
+                topk_weights=dispatch_output.topk_weights,
+                masked_m=torch.cat(
+                    (
+                        dispatch_output.masked_m,
+                        dispatch_output.masked_m.new_full((1,), local_rows),
+                    )
+                ),
+                expected_m=dispatch_output.expected_m,
+                local_shared_rows=local_rows,
+            )
+
+        if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+            raise RuntimeError(
+                "Normal DeepEP shared rows must use the separate local branch."
+            )
+
+        raise RuntimeError(
+            "DeepEP local shared grouping only supports normal or low-latency "
+            f"dispatch, got {dispatch_output.format}."
+        )
 
     def dispatch(
         self,

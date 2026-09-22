@@ -654,6 +654,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     out_cache_loc = out_cache_loc.contiguous()
                 forward_batch.out_cache_loc = out_cache_loc[i]
                 spec_info.hidden_states = hidden_states
+                # The current chain width is authoritative. Under attention-DP
+                # the draft LM-head may run on the execution-group padded BS
+                # (for example local BS4 while another rank temporarily has
+                # BS5 during wave admission). Its direct Top-1 and hidden-state
+                # outputs must be trimmed back before the next draft step;
+                # otherwise ``scores`` still has BS4 and the next tree-select
+                # multiplies incompatible BS4/BS5 tensors.
+                active_draft_rows = topk_index.shape[0]
 
                 canary_index_ctx = (
                     c.with_active_single_forward_manager(i)
@@ -684,7 +692,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                         raise RuntimeError(
                             "direct draft Top-1 requires topk=1 without rejection sampling"
                         )
-                    topk_index = direct_top1
+                    if direct_top1.shape[0] < active_draft_rows:
+                        raise RuntimeError(
+                            "direct draft Top-1 returned fewer rows than the "
+                            f"active chain: {direct_top1.shape[0]} < "
+                            f"{active_draft_rows}"
+                        )
+                    topk_index = direct_top1[:active_draft_rows]
                     topk_p = torch.ones_like(topk_index, dtype=torch.float32)
                     forward_batch.positions.add_(1)
                 elif get_spec().speculative_use_rejection_sampling:
@@ -725,6 +739,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
                 hidden_states = logits_output.hidden_states
+                if direct_top1 is not None and hidden_states is not None:
+                    if hidden_states.shape[0] < active_draft_rows:
+                        raise RuntimeError(
+                            "draft hidden states returned fewer rows than the "
+                            f"active chain: {hidden_states.shape[0]} < "
+                            f"{active_draft_rows}"
+                        )
+                    hidden_states = hidden_states[:active_draft_rows]
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1)
@@ -1083,6 +1105,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
             server_args.speculative_algorithm
         )
 
+        # Post-verify callbacks are not rank-aligned under overlap scheduling.
+        # Accumulate locally and piggyback these values on the scheduler's next
+        # mandatory attention-DP synchronization.
+        self._adaptive_stats_via_scheduler = (
+            server_args.speculative_adaptive and get_parallel().attn_dp_size > 1
+        )
+        self._adaptive_pending_accept_sum = 0
+        self._adaptive_pending_request_count = 0
+        self._adaptive_pending_max_batch = 0
+
         self._draft_worker = EagleDraftWorker(
             server_args,
             gpu_id,
@@ -1128,32 +1160,25 @@ class EAGLEWorkerV2(BaseSpecWorker):
         super().init_cuda_graphs()
         # Build adaptive runtime states after target and draft backends exist.
         if self.adaptive_controller is not None:
-            with (
-                self._draft_worker.draft_tp_context(
-                    self._draft_worker.draft_runner.tp_group
+            self.adaptive_controller.register(
+                SpecRuntimeState(
+                    speculative_num_steps=self.speculative_num_steps,
+                    speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                    draft_attn_backend=self._draft_worker.draft_attn_backend,
+                    cuda_graph_runner=self._draft_worker.cuda_graph_runner,
+                    target_attn_backend=self._target_worker.model_runner.attn_backend,
+                    target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
+                    draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
+                    cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
+                )
+            )
+            self.adaptive_controller.init_states(
+                cuda_graph_bs=(
+                    None
+                    if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
+                    else get_exec().graph.cuda_graph_bs_decode
                 ),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-            ):
-                self.adaptive_controller.register(
-                    SpecRuntimeState(
-                        speculative_num_steps=self.speculative_num_steps,
-                        speculative_num_draft_tokens=self.speculative_num_draft_tokens,
-                        draft_attn_backend=self._draft_worker.draft_attn_backend,
-                        cuda_graph_runner=self._draft_worker.cuda_graph_runner,
-                        target_attn_backend=self._target_worker.model_runner.attn_backend,
-                        target_graph_runner=self._target_worker.model_runner.decode_cuda_graph_runner,
-                        draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
-                        cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
-                    )
-                )
-                self.adaptive_controller.init_states(
-                    cuda_graph_bs=(
-                        None
-                        if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
-                        else get_exec().graph.cuda_graph_bs_decode
-                    ),
-                )
+            )
 
     def forward_batch_generation(
         self, batch: ScheduleBatch, on_publish=None, grammar_barrier=None
@@ -1340,13 +1365,51 @@ class EAGLEWorkerV2(BaseSpecWorker):
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0
     ) -> None:
-        if self.adaptive_controller is not None:
+        if self.adaptive_controller is None:
+            return
+        if self._adaptive_stats_via_scheduler:
+            self._adaptive_pending_accept_sum += sum(num_correct_drafts_per_req)
+            self._adaptive_pending_request_count += len(
+                num_correct_drafts_per_req
+            )
+            self._adaptive_pending_max_batch = max(
+                self._adaptive_pending_max_batch, batch_size
+            )
+        else:
             self.adaptive_controller.on_verify_complete(
                 num_correct_drafts_per_req, batch_size=batch_size
             )
 
+    def take_pending_adaptive_stats(self) -> tuple[int, int, int]:
+        stats = (
+            self._adaptive_pending_accept_sum,
+            self._adaptive_pending_request_count,
+            self._adaptive_pending_max_batch,
+        )
+        self._adaptive_pending_accept_sum = 0
+        self._adaptive_pending_request_count = 0
+        self._adaptive_pending_max_batch = 0
+        return stats
+
+    def on_adaptive_stats_synchronized(
+        self, accepted_draft_sum: int, request_count: int, max_local_batch: int
+    ) -> None:
+        if self.adaptive_controller is None or request_count == 0:
+            return
+        self.adaptive_controller.on_synchronized_verify_complete(
+            [accepted_draft_sum / request_count], batch_size=max_local_batch
+        )
+
     def activate_step_by_batch(self, batch_size: int) -> None:
         if self.adaptive_controller is not None:
+            if (
+                self._adaptive_stats_via_scheduler
+                and not self.adaptive_controller.has_synchronized_stats
+            ):
+                # Local DP request counts can differ during admission. Keep the
+                # launch-time state until the first scheduler-piggybacked global
+                # sample establishes a common routing batch size.
+                return
             self.adaptive_controller.activate_step_by_batch(batch_size)
 
     # -- Adaptive speculative decoding protocol --
@@ -1366,8 +1429,20 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_num_draft_tokens,
             cuda_graph_bs=cuda_graph_bs,
         ):
-            self._draft_worker.init_attention_backend()
-            self._draft_worker._capture_cuda_graphs()
+            # The draft model is attention-DP local (TP1 in the DP8 winner),
+            # while target verify still gathers over the original TP/EP stage.
+            # Keep the draft-only group override tightly scoped: carrying it
+            # into target graph capture makes the target allocate DP8 buffers
+            # but execute collectives on TP1.
+            with (
+                self._draft_worker.draft_tp_context(
+                    self._draft_worker.draft_runner.tp_group
+                ),
+                speculative_moe_backend_context(),
+                speculative_moe_a2a_backend_context(),
+            ):
+                self._draft_worker.init_attention_backend()
+                self._draft_worker._capture_cuda_graphs()
 
             # Build target attention backend and CUDA graph runner
             target_model_runner = self._target_worker.model_runner
@@ -1378,6 +1453,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
             finally:
                 target_model_runner.init_new_workspace = backup_init
+
+            # MiniMax's sparse child caches and validates the packed target
+            # verify width on the backend instance. ServerArgs is a read-only
+            # startup record, so bind this adaptive state's width directly to
+            # the newly-created backend.
+            target_sparse_backend = getattr(
+                target_attn_backend, "sparse", target_attn_backend
+            )
+            if hasattr(target_sparse_backend, "speculative_num_draft_tokens"):
+                target_sparse_backend.speculative_num_draft_tokens = (
+                    speculative_num_draft_tokens
+                )
 
             target_graph_runner = None
             if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):

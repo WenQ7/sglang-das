@@ -213,6 +213,40 @@ assert isinstance(DeepEPNormalDispatchOutput, DispatchOutput)
 assert isinstance(DeepEPLLDispatchOutput, DispatchOutput)
 
 
+@dataclass
+class DeepEPNormalLocalSharedDispatchOutput:
+    """Normal DeepEP output with a local-only shared group appended."""
+
+    hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    num_recv_tokens_per_expert: List[int]
+    local_shared_rows: int
+    routed_recv_rows: int
+
+    @property
+    def format(self) -> DispatchOutputFormat:
+        return DispatchOutputFormat.DEEPEP_NORMAL
+
+
+@dataclass
+class DeepEPLLLocalSharedDispatchOutput:
+    """Low-latency DeepEP output with a local-only shared group appended."""
+
+    hidden_states: torch.Tensor
+    hidden_states_scale: Optional[torch.Tensor]
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    masked_m: torch.Tensor
+    expected_m: int
+    local_shared_rows: int
+
+    @property
+    def format(self) -> DispatchOutputFormat:
+        return DispatchOutputFormat.DEEPEP_LL
+
+
 class DeepEPNormalCombineInput(NamedTuple):
     """DeepEP normal combine input."""
 
@@ -231,6 +265,30 @@ class DeepEPLLCombineInput(NamedTuple):
     hidden_states: torch.Tensor
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
+
+    @property
+    def format(self) -> CombineInputFormat:
+        return CombineInputFormat.DEEPEP_LL
+
+
+@dataclass
+class DeepEPNormalLocalSharedCombineInput:
+    hidden_states: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    local_shared_output: torch.Tensor
+
+    @property
+    def format(self) -> CombineInputFormat:
+        return CombineInputFormat.DEEPEP_NORMAL
+
+
+@dataclass
+class DeepEPLLLocalSharedCombineInput:
+    hidden_states: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    local_shared_output: torch.Tensor
 
     @property
     def format(self) -> CombineInputFormat:
@@ -1061,7 +1119,9 @@ class DeepEPDispatcher(BaseDispatcher):
         self,
         combine_input: CombineInput,
     ):
-        hidden_states, topk_ids, topk_weights = combine_input
+        hidden_states = combine_input.hidden_states
+        topk_ids = combine_input.topk_ids
+        topk_weights = combine_input.topk_weights
         self._update_stage(_Stage.AFTER_DISPATCH_B, _Stage.AFTER_COMBINE_A)
         inner_state = self._get_impl().combine_a(
             hidden_states=hidden_states,

@@ -2054,6 +2054,20 @@ class Scheduler(
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
+            take_pending_adaptive_stats=getattr(
+                self.model_worker,
+                "take_pending_adaptive_stats",
+                lambda: (0, 0, 0),
+            ),
+            on_adaptive_stats_synchronized=getattr(
+                self.model_worker,
+                "on_adaptive_stats_synchronized",
+                lambda _accepted, _count, _batch: None,
+            ),
+            adaptive_sync_enabled=(
+                self.server_args.speculative_adaptive
+                and get_parallel().attn_dp_size > 1
+            ),
         )
 
     def init_pool_stats_observer(self) -> None:

@@ -153,6 +153,7 @@ def _run_flash_mla_indexer(
     topk: int,
     init_blocks: int,
     local_blocks: int,
+    safe_pages: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Run gfx938 FlashMLA MSA128 Stage-1 + Stage-2 exactly."""
     *_, stage1, stage2 = _load_flash_mla()
@@ -189,7 +190,17 @@ def _run_flash_mla_indexer(
     # decode CUDA graph.  k_end is the live, device-side exclusive bound, so
     # padded page-table entries are never visible to the score computation.
     fixed_k_len = max_pages * block_size
-    safe_pages = page_table.clamp_min(0).reshape(-1).contiguous()
+    if safe_pages is None:
+        safe_pages = page_table.clamp_min(0).reshape(-1).contiguous()
+    elif (
+        safe_pages.device != page_table.device
+        or safe_pages.dtype != page_table.dtype
+        or safe_pages.numel() != page_table.numel()
+    ):
+        raise FlashMLAGfx938UnavailableError(
+            "FlashMLA MSA128 cached safe-page metadata does not match the "
+            "current page table"
+        )
     score = stage1(
         q,
         _paged_index_k(k_cache, block_size),
@@ -224,17 +235,21 @@ def flash_mla_sparse_prefill_indexer(
     topk: int,
     init_blocks: int,
     local_blocks: int,
+    k_end: Optional[torch.Tensor] = None,
+    safe_pages: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     q_lens = tuple(int(x) for x in q_lens_cpu)
-    cu = cu_seqlens.to(device=idx_q.device, dtype=torch.long)
-    lens = torch.tensor(q_lens, device=idx_q.device, dtype=torch.long)
-    batch_ids = torch.arange(
-        len(q_lens), device=idx_q.device, dtype=torch.long
-    ).repeat_interleave(lens)
-    within = torch.arange(idx_q.shape[0], device=idx_q.device) - cu[
-        :-1
-    ].repeat_interleave(lens)
-    k_end = prefix_lens.to(torch.long)[batch_ids] + within + 1
+    if k_end is None:
+        # Compatibility path for callers that do not provide forward-local
+        # metadata. The MiniMax backend caches this value across sparse layers.
+        lens = torch.tensor(q_lens, device=idx_q.device, dtype=torch.long)
+        k_end = build_flash_mla_sparse_prefill_k_end(
+            cu_seqlens,
+            prefix_lens,
+            lens,
+            idx_q.shape[0],
+            idx_q.device,
+        )
     return _run_flash_mla_indexer(
         q=idx_q,
         k_cache=idx_k_cache,
@@ -245,7 +260,43 @@ def flash_mla_sparse_prefill_indexer(
         topk=topk,
         init_blocks=init_blocks,
         local_blocks=local_blocks,
+        safe_pages=safe_pages,
     )
+
+
+def build_flash_mla_sparse_prefill_k_end(
+    cu_seqlens: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    q_lens: torch.Tensor,
+    num_queries: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Build device-side exclusive KV bounds once for one ragged segment.
+
+    ``q_lens`` is already a device tensor in the serving backend. Accepting it
+    directly avoids the tiny pageable H2D copy that otherwise serializes the
+    host once per sparse layer and CP segment.
+    """
+    cu = cu_seqlens.to(device=device, dtype=torch.long)
+    lens = q_lens.to(device=device, dtype=torch.long)
+    if lens.numel() != prefix_lens.numel() or int(num_queries) < 0:
+        raise FlashMLAGfx938UnavailableError(
+            "FlashMLA MSA128 cached prefill metadata has inconsistent batch "
+            f"dimensions: q_lens={lens.numel()}, prefix_lens={prefix_lens.numel()}, "
+            f"queries={num_queries}"
+        )
+    batch_ids = torch.arange(
+        lens.numel(), device=device, dtype=torch.long
+    ).repeat_interleave(lens)
+    if batch_ids.numel() != int(num_queries):
+        raise FlashMLAGfx938UnavailableError(
+            "FlashMLA MSA128 cached prefill metadata has inconsistent query rows: "
+            f"q_lens rows={batch_ids.numel()}, queries={num_queries}"
+        )
+    within = torch.arange(int(num_queries), device=device) - cu[
+        :-1
+    ].repeat_interleave(lens)
+    return (prefix_lens.to(torch.long)[batch_ids] + within + 1).to(torch.int32)
 
 
 def flash_mla_sparse_decode_indexer(
@@ -422,22 +473,48 @@ def flash_mla_sparse_decode_main(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    verify_group_size: int = 1,
 ) -> torch.Tensor:
-    """Run decode/verify rows as ``[batch_rows, s_q=1, 64, 128]``."""
+    """Run decode or target verify through the native multi-Q interface.
+
+    Target-verify tensors arrive flattened in request-major order. Keeping the
+    speculative positions in ``s_q`` lets FlashMLA schedule them as one request
+    instead of treating every position as an unrelated decode row.
+    """
     _, flash_mla_with_kvcache, _, expand, *_ = _load_flash_mla()
     _validate_contract(q, k_cache, v_cache, topk_idx, page_table, block_size_k)
     rows = q.shape[0]
+    verify_group_size = int(verify_group_size)
+    if verify_group_size <= 0 or rows % verify_group_size:
+        raise FlashMLAGfx938UnavailableError(
+            "FlashMLA decode rows must be divisible by verify_group_size, got "
+            f"rows={rows}, verify_group_size={verify_group_size}"
+        )
+    batch = rows // verify_group_size
     if topk_idx.shape[:2] != (4, rows) or seq_lens.numel() != rows:
         raise FlashMLAGfx938UnavailableError(
             "FlashMLA decode shape mismatch: expected topk=[4, rows, 16] and "
             f"seq_lens=[rows], got topk={tuple(topk_idx.shape)}, "
             f"seq_lens={tuple(seq_lens.shape)}, rows={rows}"
         )
-    blocks = topk_idx.permute(1, 0, 2).unsqueeze(1).contiguous().to(torch.int32)
+    if page_table.shape[0] != batch:
+        raise FlashMLAGfx938UnavailableError(
+            "FlashMLA grouped decode needs one page-table row per request, got "
+            f"page_table={tuple(page_table.shape)}, batch={batch}, "
+            f"verify_group_size={verify_group_size}"
+        )
+    q_grouped = q.reshape(batch, verify_group_size, 64, 128)
+    blocks = (
+        topk_idx.permute(1, 0, 2)
+        .reshape(batch, verify_group_size, 4, 16)
+        .contiguous()
+        .to(torch.int32)
+    )
+    grouped_seq_lens = seq_lens.reshape(batch, verify_group_size).to(torch.int32)
     indices = expand(
         blocks,
         causal=True,
-        seqused_k=seq_lens.to(torch.int32),
+        seqused_k=grouped_seq_lens,
         page_table=page_table,
         output=indices_output,
         s_q_axis=1,
@@ -449,7 +526,7 @@ def flash_mla_sparse_decode_main(
         q_scale
     ) * unit_scale(k_scale)
     output, _ = flash_mla_with_kvcache(
-        q.unsqueeze(1),
+        q_grouped,
         k_paged,
         None,
         None,
@@ -461,6 +538,6 @@ def flash_mla_sparse_decode_main(
         indices=indices,
         v_cache=v_paged,
     )
-    output = output.squeeze(1)
+    output = output.reshape(rows, 64, 128)
     value_scale = unit_scale(v_scale)
     return output if value_scale == 1.0 else output * value_scale
