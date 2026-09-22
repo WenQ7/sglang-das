@@ -20,8 +20,10 @@ python3 -m sglang.test.run_eval --port 30000 --eval-name mmlu --num-examples 10
 import argparse
 import json
 import os
+import shutil
 import statistics
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -58,6 +60,19 @@ def parse_json_object(value: str) -> dict:
         raise argparse.ArgumentTypeError("must be a JSON object")
 
     return parsed
+
+
+def _local_eval_subprocess_env(host: str | None) -> dict[str, str]:
+    """Return an environment that never proxies the local eval endpoint."""
+    eval_env = os.environ.copy()
+    no_proxy_hosts = ["127.0.0.1", "localhost", "0.0.0.0", str(host or "")]
+    for key in ("NO_PROXY", "no_proxy"):
+        entries = [item for item in eval_env.get(key, "").split(",") if item]
+        entries.extend(
+            value for value in no_proxy_hosts if value and value not in entries
+        )
+        eval_env[key] = ",".join(entries)
+    return eval_env
 
 
 def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
@@ -104,11 +119,14 @@ def run_eval_once(args, base_url: str, eval_obj: Eval) -> dict:
             stop=stop,
         )
     else:
+        model_name = (common_kwargs.get("model") or "").lower()
+        is_minimax_m3 = "minimax-m3" in model_name or "minimax_m3" in model_name
         sampler = ChatCompletionSampler(
             **common_kwargs,
             reasoning_effort=getattr(args, "reasoning_effort", None),
             extra_body=extra_body if extra_body else None,
             record_meta_info=True,
+            use_reasoning_content_fallback=is_minimax_m3,
         )
 
     # Run eval
@@ -124,6 +142,13 @@ def _run_sgl_eval(eval_name, args) -> dict:
     # existing write_results_to_json + threshold gate keep working.
     from sglang.test.test_utils import dump_metric
 
+    if shutil.which("sgl-eval") is None:
+        raise RuntimeError(
+            "The official sgl-eval harness is not installed. Install it with "
+            "`pip install git+https://github.com/sgl-project/sgl-eval`, then "
+            "rerun with `--api sgl_eval`."
+        )
+
     base_url = (
         f"{args.base_url}/v1" if args.base_url else f"http://{args.host}:{args.port}/v1"
     )
@@ -133,8 +158,18 @@ def _run_sgl_eval(eval_name, args) -> dict:
     ).expanduser()
     out_parent.mkdir(parents=True, exist_ok=True)
 
+    model_l = (getattr(args, "model", None) or "").lower()
+    is_minimax_m3 = "minimax-m3" in model_l or "minimax_m3" in model_l
+    # sgl-eval 0.0.1 drops OpenAI ``reasoning_content``. MiniMax-M3 can keep
+    # its whole answer in that channel, so use the repository-owned adapter
+    # for M3 only. Other models retain the unmodified installed CLI path.
+    cli = (
+        [sys.executable, "-m", "sglang.test.sgl_eval_reasoning_compat"]
+        if is_minimax_m3
+        else ["sgl-eval"]
+    )
     cmd = [
-        "sgl-eval",
+        *cli,
         "run",
         eval_name,
         "--base-url",
@@ -152,6 +187,12 @@ def _run_sgl_eval(eval_name, args) -> dict:
         cmd += ["--num-examples", str(args.num_examples)]
     if getattr(args, "top_p", None) is not None:
         cmd += ["--top-p", str(args.top_p)]
+    if getattr(args, "top_k", None) is not None:
+        raise ValueError(
+            "The installed official sgl-eval CLI does not expose --top-k. "
+            "Leave --top-k unset for a comparable sgl-eval run instead of "
+            "silently changing the sampling configuration."
+        )
     # Unset by default in sgl-eval; only a sampling caller (temperature > 0) needs it.
     if getattr(args, "seed", None) is not None:
         cmd += ["--seed", str(args.seed)]
@@ -162,14 +203,52 @@ def _run_sgl_eval(eval_name, args) -> dict:
         cmd += ["--max-tokens", str(args.max_tokens)]
     else:
         cmd += ["--max-tokens", "2048"]
-    # Reasoning models (e.g. Qwen3.5) put their answer in the reasoning channel;
-    # without --thinking their message.content is empty and sgl-eval scores 0.
-    if getattr(args, "sgl_eval_thinking", None) is None:
-        model_l = (getattr(args, "model", None) or "").lower()
-        if "qwen3.5" in model_l or "qwen3-thinking" in model_l:
-            cmd += ["--thinking"]
-    elif args.sgl_eval_thinking:
+    # Reasoning models put their answer in the reasoning channel.  sgl-eval's
+    # generic --thinking flag sends chat_template_kwargs.thinking=true.  The
+    # MiniMax-M3 checkpoint template does not read that key: it reads
+    # thinking_mode=enabled|adaptive|disabled.  Preserve the generic flag for
+    # harness compatibility and also pass the model-specific key so an M3 run
+    # actually uses the requested reasoning mode.
+    explicit_template_kwargs = getattr(args, "chat_template_kwargs", None) or {}
+    if isinstance(explicit_template_kwargs, str):
+        explicit_template_kwargs = parse_json_object(explicit_template_kwargs)
+
+    thinking_override = getattr(args, "sgl_eval_thinking", None)
+    if thinking_override is None:
+        thinking_enabled = (
+            "qwen3.5" in model_l or "qwen3-thinking" in model_l or is_minimax_m3
+        )
+    else:
+        thinking_enabled = bool(thinking_override)
+
+    if thinking_enabled:
         cmd += ["--thinking"]
+    elif thinking_override is False:
+        cmd += ["--no-thinking"]
+
+    if is_minimax_m3 and "thinking_mode" not in explicit_template_kwargs:
+        explicit_template_kwargs = {
+            **explicit_template_kwargs,
+            "thinking_mode": "enabled" if thinking_enabled else "disabled",
+        }
+
+    for key, value in explicit_template_kwargs.items():
+        cmd += [
+            "--chat-template-kwarg",
+            f"{key}={json.dumps(value, separators=(',', ':'))}",
+        ]
+
+    # Keep the exact harness invocation in the log.  This is part of the
+    # accuracy artifact: scores from different prompt/thinking/sampling
+    # protocols are not comparable even when they all say "GSM8K".
+    print("sgl-eval command:", " ".join(cmd), flush=True)
+
+    # The eval server is normally local.  Python/httpx honors HTTP(S)_PROXY,
+    # but unlike curl it does not always bypass loopback implicitly.  Without
+    # this guard a machine-wide proxy can turn every local accuracy request
+    # into a retried 503 and the resulting empty generations look like a model
+    # accuracy regression.
+    eval_env = _local_eval_subprocess_env(getattr(args, "host", None))
 
     try:
         completed = subprocess.run(
@@ -178,6 +257,7 @@ def _run_sgl_eval(eval_name, args) -> dict:
             capture_output=True,
             check=False,
             timeout=getattr(args, "sgl_eval_timeout", None),
+            env=eval_env,
         )
     except subprocess.TimeoutExpired as e:
         raise TimeoutError(
@@ -203,9 +283,30 @@ def _run_sgl_eval(eval_name, args) -> dict:
         raise KeyError(f"{metrics_files[0]} missing aggregate.score")
 
     metrics = dict(aggregate)
+    metrics["num_examples"] = int(payload.get("num_examples", 0))
+    metrics["n_repeats"] = int(payload.get("n_repeats", 0))
     metrics["latency"] = payload.get("latency_seconds", 0.0)
     metrics["output_throughput"] = payload.get("output_throughput_tps", 0.0)
     metrics["sgl_eval_metrics_path"] = str(metrics_files[0])
+
+    # A partial or errored run must never become a valid accuracy result.  An
+    # error response is otherwise scored as a wrong answer, which can hide a
+    # serving failure inside an apparently plausible aggregate score.
+    expected_examples = getattr(args, "num_examples", None)
+    if expected_examples is not None and metrics["num_examples"] != int(
+        expected_examples
+    ):
+        raise RuntimeError(
+            "Incomplete sgl-eval run: "
+            f"metrics contain {metrics['num_examples']} examples, "
+            f"expected {int(expected_examples)}"
+        )
+    error_rate = float(metrics.get("error_rate", 0.0) or 0.0)
+    if error_rate != 0.0 and not getattr(args, "allow_sgl_eval_errors", False):
+        raise RuntimeError(
+            f"sgl-eval reported error_rate={error_rate:.6f}; refusing to "
+            "treat request failures as model accuracy errors"
+        )
 
     model = payload.get("model") or getattr(args, "model", None)
     dump_metric(
@@ -222,6 +323,12 @@ def _run_sgl_eval(eval_name, args) -> dict:
     print(f"Total latency: {metrics['latency']:.3f} s")
     print(f"Output throughput: {metrics['output_throughput']:.3f} token/s")
     print(f"sgl-eval metrics: {metrics_files[0]}")
+    threshold = getattr(args, "accuracy_threshold", None)
+    if threshold is not None and float(metrics["score"]) < float(threshold):
+        raise AssertionError(
+            f"{eval_name} accuracy gate failed: score={float(metrics['score']):.6f} "
+            f"< threshold={float(threshold):.6f}"
+        )
     return metrics
 
 
@@ -457,6 +564,14 @@ def run_eval(args):
         f.write(json.dumps(metrics, indent=2))
     print(f"Writing results to {result_filename}")
 
+    threshold = getattr(args, "accuracy_threshold", None)
+    gate_score = metrics.get("mean_score", metrics.get("score"))
+    if threshold is not None and float(gate_score) < float(threshold):
+        raise AssertionError(
+            f"{args.eval_name} accuracy gate failed: score={float(gate_score):.6f} "
+            f"< threshold={float(threshold):.6f}"
+        )
+
     if getattr(args, "return_latency", False):
         return metrics, latency
     return metrics
@@ -493,14 +608,53 @@ if __name__ == "__main__":
         "--api",
         type=str,
         default="chat",
-        choices=["chat", "completion", "generate"],
-        help="API mode: 'chat' for /v1/chat/completions, 'completion' for /v1/completions, 'generate' for SGLang-native /generate",
+        choices=["chat", "completion", "generate", "sgl_eval"],
+        help=(
+            "API mode: 'chat' for /v1/chat/completions, 'completion' for "
+            "/v1/completions, 'generate' for SGLang-native /generate, or "
+            "'sgl_eval' for the official sgl-eval task harness"
+        ),
     )
     parser.add_argument("--num-examples", type=int)
     parser.add_argument("--num-threads", type=int, default=512)
     parser.add_argument("--max-tokens", type=int, default=2048)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Sampling seed. Leave unset to match the published sgl-eval command.",
+    )
+    parser.add_argument(
+        "--sgl-eval-out-dir",
+        type=str,
+        default=None,
+        help="Parent directory for the official sgl-eval metrics and predictions.",
+    )
+    parser.add_argument(
+        "--sgl-eval-timeout",
+        type=float,
+        default=None,
+        help="Optional wall-clock timeout in seconds for the complete sgl-eval run.",
+    )
+    parser.add_argument(
+        "--sgl-eval-thinking",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Override the official harness thinking flag.",
+    )
+    parser.add_argument(
+        "--allow-sgl-eval-errors",
+        action="store_true",
+        help="Allow nonzero request error_rate (diagnostics only; off by default).",
+    )
+    parser.add_argument(
+        "--accuracy-threshold",
+        type=float,
+        default=None,
+        help="Fail the evaluation process when score (or repeated mean score) is below this value.",
+    )
     parser.add_argument(
         "--top-k", type=int, default=None, help="Top-k sampling parameter"
     )

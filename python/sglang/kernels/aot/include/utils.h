@@ -371,26 +371,25 @@ __device__ __forceinline__ dstDtype castFromFloat(float val) {
 
 #endif
 
-// add FP8 support
-// #ifndef USE_ROCM
-// #include <c10/util/Float8_e4m3fn.h>
-// using FP8_TYPE = c10::Float8_e4m3fn;
-// C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
-// #else  // USE_ROCM
-// #if HIP_FP8_TYPE_FNUZ
-// #include <c10/util/Float8_e4m3fnuz.h>
-// using FP8_TYPE = c10::Float8_e4m3fnuz;
-// constexpr auto FP8_E4M3_MAX = 224.0f;
-// #else
-// #if HIP_FP8_TYPE_E4M3
-// #include <c10/util/Float8_e4m3fn.h>
-// using FP8_TYPE = c10::Float8_e4m3fn;
-// C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
-// #else
-// #error "fp8 is not supported in this processor (arch < gfx942)."
-// #endif  // HIP_FP8_TYPE_E4M3
-// #endif  // HIP_FP8_TYPE_FNUZ
-// #endif  // USE_ROCM
+// FP8 type used by the per-token quantization kernels. ROCm selects the
+// checkpoint-compatible encoding at build time; CUDA uses e4m3fn.
+#ifndef USE_ROCM
+#include <c10/util/Float8_e4m3fn.h>
+using FP8_TYPE = c10::Float8_e4m3fn;
+C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
+#else  // USE_ROCM
+#if HIP_FP8_TYPE_FNUZ
+#include <c10/util/Float8_e4m3fnuz.h>
+using FP8_TYPE = c10::Float8_e4m3fnuz;
+constexpr auto FP8_E4M3_MAX = 224.0f;
+#elif HIP_FP8_TYPE_E4M3
+#include <c10/util/Float8_e4m3fn.h>
+using FP8_TYPE = c10::Float8_e4m3fn;
+C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
+#else
+#error "FP8 is not supported for this ROCm target."
+#endif
+#endif  // USE_ROCM
 
 #define FULL_MASK 0xffffffff
 

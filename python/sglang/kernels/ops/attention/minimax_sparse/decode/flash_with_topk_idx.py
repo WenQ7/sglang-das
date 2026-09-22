@@ -12,10 +12,41 @@ from ..common.utils import (
     _bitonic_merge,
     _sort_ids_ascending,
     check_sparse_kv_fp8,
+    merge_dcp_block_scores,
     robust_allocator,
     sparse_out_dtype,
     unit_scale,
 )
+
+
+def _select_decode_score_num_kv_chunks(
+    batch_size: int,
+    num_kv_heads: int,
+    *,
+    target_grid: Optional[int] = None,
+    max_chunks: Optional[int] = None,
+) -> int:
+    """Select a graph-stable power-of-two split count for score decode.
+
+    Explicit arguments are used by host-only tests and tuning tools. Runtime
+    calls read the corresponding SGLang environment settings.
+    """
+
+    if target_grid is None:
+        target_grid = envs.SGLANG_MINIMAX_DECODE_SCORE_TARGET_GRID.get()
+    if max_chunks is None:
+        max_chunks = envs.SGLANG_MINIMAX_DECODE_SCORE_MAX_CHUNKS.get()
+    if batch_size <= 0 or num_kv_heads <= 0:
+        raise ValueError("batch_size and num_kv_heads must be positive")
+    if target_grid <= 0:
+        raise ValueError("SGLANG_MINIMAX_DECODE_SCORE_TARGET_GRID must be positive")
+    if max_chunks <= 0:
+        raise ValueError("SGLANG_MINIMAX_DECODE_SCORE_MAX_CHUNKS must be positive")
+    target = max(
+        1,
+        min(max_chunks, target_grid // (batch_size * num_kv_heads)),
+    )
+    return 1 << (target.bit_length() - 1)
 
 
 @triton.heuristics(
@@ -31,7 +62,12 @@ from ..common.utils import (
     configs=[
         triton.Config({"BLOCK_SIZE_N": BN}, num_warps=nw, num_stages=ns)
         for BN in [64, 128, 256, 512]
-        for nw in [4, 8, 16]
+        # gfx938's long-context MiniMax decode autotune bucket (B=8, H=1,
+        # D=128, block=128) is memory/occupancy bound.  Two warps preserve the exact
+        # BLOCK_SIZE_N=128 reduction tree while reducing the score producer by
+        # about 16% versus four warps.  Keep the wider choices for other
+        # architectures and shapes; autotune selects per batch/head bucket.
+        for nw in [2, 4, 8, 16]
         for ns in [1, 2, 3]
     ],
     key=[
@@ -85,6 +121,8 @@ def _decode_score_kernel(
     SCORE_TYPE: tl.constexpr,
     SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr,
     IS_FP8: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
 ):
     tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
     sm_scale_log2e = sm_scale * 1.4426950409
@@ -146,8 +184,16 @@ def _decode_score_kernel(
     ).to(tl.int64)
     # score-only: compute block scores without loading V
     for i in range(chunk_start, chunk_end, BLOCK_SIZE_N):
+        positions = i + off_n
         pos_mask = prefetch_mask
         slots = prefetched_slots
+        if DCP_SIZE > 1:
+            # The DCP allocator exposes virtual global slots while every rank's
+            # physical MiniMax cache owns only positions congruent to DCP_RANK.
+            # A per-block local max followed by a cross-rank max is exactly the
+            # original block max used by MiniMax's score_type="max".
+            pos_mask = pos_mask & (positions % DCP_SIZE == DCP_RANK)
+            slots = slots // DCP_SIZE
         # prefetch next iteration's slots
         next_i = i + BLOCK_SIZE_N
         if next_i < chunk_end:
@@ -176,7 +222,10 @@ def _decode_score_kernel(
             k = k.to(q.dtype)
         # compute qk
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
-        qk += tl.where(off_n[None, :] < chunk_end - i, 0, float("-inf"))
+        if DCP_SIZE > 1:
+            qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+        else:
+            qk += tl.where(off_n[None, :] < chunk_end - i, 0, float("-inf"))
         # [H, D], [D, N] -> [H, N]
         qk += tl.dot(q, k) * (sm_scale_log2e * k_scale)
         # save qk to score
@@ -207,6 +256,218 @@ def _decode_score_kernel(
 
 @triton.heuristics(
     {
+        "REQUEST_BATCH_SIZE_BUCKET": lambda args: triton.next_power_of_2(
+            args["request_batch_size"]
+        ),
+        "BLOCK_SIZE_H": lambda args: max(
+            16, triton.next_power_of_2(args["gqa_group_size"])
+        ),
+        "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
+    }
+)
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_SIZE_N": 128}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_SIZE_N": 128}, num_warps=4, num_stages=1),
+    ],
+    key=[
+        "REQUEST_BATCH_SIZE_BUCKET",
+        "gqa_group_size",
+        "head_dim",
+        "block_size",
+        "SCORE_TYPE",
+    ],
+)
+@triton.jit
+def _decode_multi_q_score_kernel(
+    q_ptr,  # Q: (request_batch * VERIFY_GROUP_SIZE) x qh x d
+    k_cache_ptr,  # K paged: max_slots x kh x d
+    req_to_token_ptr,  # req_to_token: max_reqs x max_kv_len
+    score_ptr,  # Score: qh x (request_batch * VERIFY_GROUP_SIZE) x max_seqblock
+    seq_lens,
+    slot_ids,
+    max_slots,
+    request_batch_size,
+    gqa_group_size: tl.constexpr,
+    head_dim,
+    block_size: tl.constexpr,
+    topk: tl.constexpr,
+    sm_scale,
+    k_scale,
+    init_blocks,
+    local_blocks,
+    stride_q_b,
+    stride_q_h,
+    stride_q_d,
+    stride_k_s,
+    stride_k_h,
+    stride_k_d,
+    stride_r2t_b,
+    stride_s_h,
+    stride_s_b,
+    stride_s_n,
+    REQUEST_BATCH_SIZE_BUCKET: tl.constexpr,
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    NUM_KV_CHUNKS: tl.constexpr,
+    VERIFY_GROUP_SIZE: tl.constexpr,
+    SCORE_TYPE: tl.constexpr,
+    SKIP_TRIVIAL_TOPK_SCORE: tl.constexpr,
+    IS_FP8: tl.constexpr,
+):
+    """Score Q2/Q3/Q4/Q5 verify rows while loading each request's Index-K once.
+
+    The flattened input remains request-major and query-minor. Rows have
+    independent causal lengths and score destinations; only the common K tile
+    load is shared. Combining verify-query and GQA rows into the dot M
+    dimension is particularly cheap for MiniMax's single index head because
+    the existing decode kernel already pads M to at least 16.
+    """
+
+    tl.static_assert(VERIFY_GROUP_SIZE >= 2 and VERIFY_GROUP_SIZE <= 5)
+    tl.static_assert(SCORE_TYPE == "max" or SCORE_TYPE == "lse")
+    tl.static_assert(BLOCK_SIZE_N >= block_size)
+    BLOCKS_PER_K_BLOCK: tl.constexpr = BLOCK_SIZE_N // block_size
+
+    pid_rc, pid_kh = tl.program_id(0), tl.program_id(1)
+    pid_r = pid_rc % request_batch_size
+    pid_c = pid_rc // request_batch_size
+
+    off_h = tl.arange(0, BLOCK_SIZE_H)
+    off_n = tl.arange(0, BLOCK_SIZE_N)
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    off_bpk = tl.arange(0, BLOCKS_PER_K_BLOCK)
+
+    verify_idx = off_h // gqa_group_size
+    head_in_group = off_h % gqa_group_size
+    valid_row = verify_idx < VERIFY_GROUP_SIZE
+    flat_b = pid_r * VERIFY_GROUP_SIZE + verify_idx
+    q_head = pid_kh * gqa_group_size + head_in_group
+
+    row_seq_lens = tl.load(
+        seq_lens + flat_b,
+        mask=valid_row,
+        other=0,
+    ).to(tl.int32)
+    max_seq_len = tl.max(row_seq_lens, axis=0)
+    max_num_blocks = (max_seq_len + block_size - 1) // block_size
+    if SKIP_TRIVIAL_TOPK_SCORE:
+        if max_num_blocks <= topk:
+            return
+
+    chunk_size_blocks = tl.cdiv(max_num_blocks, NUM_KV_CHUNKS)
+    chunk_start_block = pid_c * chunk_size_blocks
+    chunk_end_block = tl.minimum(chunk_start_block + chunk_size_blocks, max_num_blocks)
+    if chunk_start_block >= chunk_end_block:
+        return
+    chunk_start = chunk_start_block * block_size
+    chunk_end = tl.minimum(chunk_end_block * block_size, max_seq_len)
+
+    # All flattened verify rows for a request point at the same request-pool
+    # slot. The first row is sufficient for resolving the shared K positions.
+    first_flat_b = pid_r * VERIFY_GROUP_SIZE
+    sid = (tl.load(slot_ids + first_flat_b).to(tl.int64) + max_slots) % max_slots
+    r2t_base = req_to_token_ptr + sid * stride_r2t_b
+
+    q_offsets = (
+        flat_b[:, None] * stride_q_b
+        + q_head[:, None] * stride_q_h
+        + off_d[None, :] * stride_q_d
+    )
+    q = tl.load(
+        q_ptr + q_offsets,
+        mask=valid_row[:, None] & (off_d[None, :] < head_dim),
+        other=0.0,
+    )
+
+    dim_mask = off_d < head_dim
+    row_num_blocks = (row_seq_lens + block_size - 1) // block_size
+    local_start = tl.maximum(0, row_num_blocks - local_blocks)
+
+    prefetch_pos = chunk_start + off_n
+    prefetch_mask = prefetch_pos < max_seq_len
+    prefetched_slots = tl.load(
+        r2t_base + prefetch_pos,
+        mask=prefetch_mask,
+        other=0,
+    ).to(tl.int64)
+
+    for i in range(chunk_start, chunk_end, BLOCK_SIZE_N):
+        positions = i + off_n
+        slots = (prefetched_slots + max_slots) % max_slots
+
+        next_i = i + BLOCK_SIZE_N
+        if next_i < chunk_end:
+            next_pos = next_i + off_n
+            prefetch_mask = next_pos < max_seq_len
+            prefetched_slots = tl.load(
+                r2t_base + next_pos,
+                mask=prefetch_mask,
+                other=0,
+            ).to(tl.int64)
+
+        k_offsets = (
+            slots[None, :] * stride_k_s
+            + pid_kh * stride_k_h
+            + off_d[:, None] * stride_k_d
+        )
+        k = tl.load(
+            k_cache_ptr + k_offsets,
+            mask=dim_mask[:, None] & (positions[None, :] < max_seq_len),
+            other=0.0,
+        )
+        if IS_FP8:
+            k = k.to(q.dtype)
+
+        causal_mask = valid_row[:, None] & (positions[None, :] < row_seq_lens[:, None])
+        qk = tl.dot(q, k) * (sm_scale * 1.4426950409 * k_scale)
+        qk = tl.where(causal_mask, qk, float("-inf"))
+
+        block_score = tl.reshape(
+            qk,
+            (BLOCK_SIZE_H, BLOCKS_PER_K_BLOCK, block_size),
+            can_reorder=False,
+        )
+        sub_max = tl.max(block_score, axis=2)
+        if SCORE_TYPE == "max":
+            block_score = sub_max
+        else:
+            block_score = sub_max + tl.log2(
+                tl.sum(tl.exp2(block_score - sub_max[:, :, None]), axis=2)
+            )
+            block_score = tl.where(
+                block_score != block_score, float("-inf"), block_score
+            )
+
+        curr_block_idx = i // block_size + off_bpk
+        is_init = curr_block_idx[None, :] < init_blocks
+        is_local = (curr_block_idx[None, :] >= local_start[:, None]) & (
+            curr_block_idx[None, :] < row_num_blocks[:, None]
+        )
+        block_score = tl.where(
+            is_local,
+            1e29,
+            tl.where(is_init, 1e30, block_score),
+        )
+
+        score_offsets = (
+            q_head[:, None] * stride_s_h
+            + flat_b[:, None] * stride_s_b
+            + curr_block_idx[None, :] * stride_s_n
+        )
+        store_mask = valid_row[:, None] & (
+            curr_block_idx[None, :] < row_num_blocks[:, None]
+        )
+        tl.store(
+            score_ptr + score_offsets,
+            block_score.to(score_ptr.dtype.element_ty),
+            mask=store_mask,
+        )
+
+
+@triton.heuristics(
+    {
         "BLOCK_SIZE_H": lambda args: max(
             16, triton.next_power_of_2(args["gqa_group_size"])
         ),
@@ -218,7 +479,7 @@ def _decode_score_kernel(
     configs=[
         triton.Config({"BLOCK_SIZE_N": BN}, num_warps=nw, num_stages=ns)
         for BN in [64, 128, 256, 512]
-        for nw in [4, 8, 16]
+        for nw in [2, 4, 8, 16]
         for ns in [1, 2, 3]
     ],
     key=[
@@ -803,11 +1064,23 @@ def flash_decode_with_topk_idx(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    dcp_group=None,
+    verify_group_size: int = 1,
 ) -> torch.Tensor:
     assert score_type in (
         "max",
         "lse",
     ), f"score_type must be 'max' or 'lse', got {score_type!r}"
+    if dcp_size > 1:
+        if score_type != "max" or not disable_index_value:
+            raise NotImplementedError(
+                "MiniMax DCP decode currently requires score_type='max' and "
+                "disable_index_value=True"
+            )
+        if dcp_group is None or dcp_group.world_size != dcp_size:
+            raise ValueError("MiniMax DCP decode requires its matching DCP group")
     triton.set_allocator(robust_allocator)
     # dtype check (v_cache is None under disable_index_value)
     is_fp8 = check_sparse_kv_fp8(
@@ -822,6 +1095,13 @@ def flash_decode_with_topk_idx(
     max_slots, num_kv_heads, _ = k_cache.shape
     max_kv_len = req_to_token.shape[1]
     assert slot_ids.shape[0] == batch_size and seq_lens.shape[0] == batch_size
+    if verify_group_size < 1:
+        raise ValueError("verify_group_size must be positive")
+    if batch_size % verify_group_size != 0:
+        raise ValueError(
+            "flattened verify batch must be divisible by verify_group_size: "
+            f"batch_size={batch_size}, verify_group_size={verify_group_size}"
+        )
     # gqa
     assert num_q_heads % num_kv_heads == 0
     gqa_group_size = num_q_heads // num_kv_heads
@@ -840,13 +1120,12 @@ def flash_decode_with_topk_idx(
     # Must only depend on cuda-graph-constant quantities (BS, num_kv_heads), not seq_len.
     # Empty chunks early-return cheaply, so over-chunking is nearly free.
     # E.g. with num_kv_heads=1: BS=1→NKC=256,CTAs=256; BS=32→NKC=128,CTAs=4096.
-    TARGET_GRID = 4096
-    MAX_NUM_KV_CHUNKS = 256
-    target = max(
-        1,
-        min(MAX_NUM_KV_CHUNKS, TARGET_GRID // max(1, batch_size * num_kv_heads)),
+    use_multi_q_verify_score = (
+        envs.SGLANG_OPT_USE_MINIMAX_MULTI_Q_VERIFY_SCORE.get()
+        and verify_group_size in (2, 3, 4, 5)
+        and disable_index_value
+        and dcp_size == 1
     )
-    NUM_KV_CHUNKS = 1 << (target.bit_length() - 1)
     score_kv_len = min(max_seqlen, max_kv_len)
     # The score producers below write every valid block column
     # [0, ceil(seq_len / block_size)) for each (head, batch) row. All consumers
@@ -863,6 +1142,12 @@ def flash_decode_with_topk_idx(
         and score.shape[2] <= 4096
         and topk <= 32
     )
+    score_grid_batch_size = (
+        batch_size // verify_group_size if use_multi_q_verify_score else batch_size
+    )
+    NUM_KV_CHUNKS = _select_decode_score_num_kv_chunks(
+        score_grid_batch_size, num_kv_heads
+    )
     # If the live context has <= topk sparse blocks, the downstream dense
     # page-table/JIT top-k kernels select every block from seq_lens directly
     # without reading score. Keep this gate in sync with the consumers below:
@@ -871,9 +1156,14 @@ def flash_decode_with_topk_idx(
     # skip these writes.
     skip_trivial_topk_score = use_dense_main_attn or use_jit_topk
 
-    grid = (batch_size * NUM_KV_CHUNKS, num_kv_heads)
+    grid = (score_grid_batch_size * NUM_KV_CHUNKS, num_kv_heads)
     if disable_index_value:
-        _decode_score_kernel[grid](
+        score_kernel = (
+            _decode_multi_q_score_kernel
+            if use_multi_q_verify_score
+            else _decode_score_kernel
+        )
+        score_kernel[grid](
             q,
             k_cache,
             req_to_token,
@@ -881,7 +1171,7 @@ def flash_decode_with_topk_idx(
             seq_lens,
             slot_ids,
             max_slots,
-            batch_size,
+            score_grid_batch_size if use_multi_q_verify_score else batch_size,
             gqa_group_size,
             head_dim,
             block_size,
@@ -904,6 +1194,11 @@ def flash_decode_with_topk_idx(
             SCORE_TYPE=score_type,
             SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
             IS_FP8=is_fp8,
+            **(
+                {"VERIFY_GROUP_SIZE": verify_group_size}
+                if use_multi_q_verify_score
+                else {"DCP_SIZE": dcp_size, "DCP_RANK": dcp_rank}
+            ),
         )
     else:
         assert v_cache is not None
@@ -967,6 +1262,12 @@ def flash_decode_with_topk_idx(
             SKIP_TRIVIAL_TOPK_SCORE=skip_trivial_topk_score,
             IS_FP8=is_fp8,
         )
+    if dcp_size > 1:
+        # all_gather is CUDA-graph capturable in the existing DCP communicator;
+        # the payload is only H*B*ceil(context/128) FP32 values (about 4 KiB per
+        # request at 128K).  Keeping TopK after this exact max merge preserves
+        # the existing deterministic tie-breaking implementation.
+        score = merge_dcp_block_scores(score, dcp_group, dcp_size)
     # Fused top-k + page-table transform: emit the dense backend's page table
     # directly (page-size-aware) instead of block ids, skipping a separate gather.
     # The page table + per-query effective KV length are allocated and returned.

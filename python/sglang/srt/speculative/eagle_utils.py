@@ -753,12 +753,35 @@ def eagle_sample(
     bs = len(batch.seq_lens)
     sampling_info = batch.sampling_info
     next_token_logits = logits_output.next_token_logits
-
-    sanitize_nan_logits(next_token_logits, "verify: target model logits")
+    direct_target_top1 = logits_output.target_topk_index
+    if direct_target_top1 is not None:
+        if next_token_logits is not None:
+            raise RuntimeError(
+                "target verify Top-1 must not also materialize vocabulary logits"
+            )
+        if not sampling_info.is_all_greedy:
+            raise RuntimeError("target verify Top-1 requires greedy sampling")
+        if (
+            sampling_info.acc_additive_penalties is not None
+            or sampling_info.acc_scaling_penalties is not None
+            or sampling_info.logit_bias is not None
+            or grammar_mask is not None
+        ):
+            raise RuntimeError(
+                "target verify Top-1 does not support penalties, logit bias, "
+                "or grammar masking"
+            )
+    else:
+        if next_token_logits is None:
+            raise RuntimeError("target verify produced neither logits nor Top-1 ids")
+        sanitize_nan_logits(next_token_logits, "verify: target model logits")
 
     # Apply penalty
     # This is a relaxed version of penalties for speculative decoding.
-    if sampling_info.acc_additive_penalties is not None:
+    if (
+        next_token_logits is not None
+        and sampling_info.acc_additive_penalties is not None
+    ):
         next_token_logits.add_(
             torch.repeat_interleave(
                 sampling_info.acc_additive_penalties,
@@ -766,14 +789,17 @@ def eagle_sample(
                 dim=0,
             )
         )
-    if sampling_info.acc_scaling_penalties is not None:
+    if (
+        next_token_logits is not None
+        and sampling_info.acc_scaling_penalties is not None
+    ):
         apply_scaling_penalties(
             next_token_logits,
             torch.repeat_interleave(
                 sampling_info.acc_scaling_penalties, verify_input.draft_token_num, dim=0
             ),
         )
-    if sampling_info.logit_bias is not None:
+    if next_token_logits is not None and sampling_info.logit_bias is not None:
         next_token_logits.add_(
             torch.repeat_interleave(
                 sampling_info.logit_bias, verify_input.draft_token_num, dim=0
@@ -781,11 +807,15 @@ def eagle_sample(
         )
 
     # Apply grammar mask if provided
-    if grammar_mask is not None:
+    if next_token_logits is not None and grammar_mask is not None:
         grammar_mask.apply(next_token_logits)
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
-    predict_shape = list(next_token_logits.shape)[:-1]
+    predict_shape = list(
+        (
+            direct_target_top1 if direct_target_top1 is not None else next_token_logits
+        ).shape
+    )[:-1]
     predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
     accept_index = torch.full(
         (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
@@ -815,9 +845,13 @@ def eagle_sample(
         or sampled_target_ids is not None
     ):
         target_predict = (
-            torch.argmax(next_token_logits, dim=-1)
-            if sampled_target_ids is None
-            else sampled_target_ids
+            direct_target_top1.reshape(-1)
+            if direct_target_top1 is not None
+            else (
+                sampled_target_ids
+                if sampled_target_ids is not None
+                else torch.argmax(next_token_logits, dim=-1)
+            )
         )
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(

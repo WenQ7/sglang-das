@@ -54,7 +54,10 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.logits_processor import (
+    LogitsProcessorOutput,
+    is_target_verify_greedy_top1_eligible,
+)
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.utils.cp_utils import is_mla_prefill_cp_enabled
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
@@ -252,6 +255,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
+        )
+        model = model_runner.model
+        self.target_verify_direct_top1 = bool(
+            getattr(model, "use_target_verify_lm_head_top1", False)
         )
 
         # --- DSA dense-decode dual-graph -------------------------------
@@ -654,6 +661,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def can_run_graph(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
+            return False
+
+        # A direct-Top1 target graph has no full-logits output.  Non-greedy or
+        # logits-modified batches must run eager so the model-level gate can
+        # transparently select the ordinary logits processor.
+        if (
+            getattr(self, "target_verify_direct_top1", False)
+            and forward_batch.forward_mode.is_target_verify()
+            and not is_target_verify_greedy_top1_eligible(forward_batch)
+        ):
             return False
 
         ragged_layout = (
@@ -1467,6 +1484,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 hidden_states=(
                     output.hidden_states[: self.raw_num_token]
                     if output.hidden_states is not None
+                    else None
+                ),
+                draft_topk_index=(
+                    output.draft_topk_index[: self.raw_num_token]
+                    if output.draft_topk_index is not None
+                    else None
+                ),
+                target_topk_index=(
+                    output.target_topk_index[: self.raw_num_token]
+                    if output.target_topk_index is not None
                     else None
                 ),
                 customized_info=output.customized_info,

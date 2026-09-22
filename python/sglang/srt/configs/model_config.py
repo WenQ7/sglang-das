@@ -226,6 +226,30 @@ def get_minimax_sparse_score_type(sparse_cfg: dict) -> str:
     return score_type
 
 
+def minimax_sparse_layer_skips_topk(
+    sparse_cfg: dict, layer_id: int, index_topk_freq: int
+) -> bool:
+    """Return whether a MiniMax sparse layer reuses its group producer's top-k.
+
+    MiniMax dense layers precede the contiguous sparse stack, so the sharing
+    cadence must be anchored at the first *sparse* layer instead of layer 0.
+    Keeping this helper independent from environment parsing lets the model
+    projection path and attention backend use exactly the same grouping.
+    """
+    if index_topk_freq <= 0:
+        raise ValueError(
+            f"MiniMax index_topk_freq must be positive, got {index_topk_freq}"
+        )
+    if index_topk_freq == 1:
+        return False
+    _, sparse_layer_ids = get_minimax_sparse_layer_ids(sparse_cfg)
+    try:
+        sparse_ordinal = sparse_layer_ids.index(layer_id)
+    except ValueError:
+        return False
+    return sparse_ordinal % index_topk_freq != 0
+
+
 def get_dsa_index_topk(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_topk

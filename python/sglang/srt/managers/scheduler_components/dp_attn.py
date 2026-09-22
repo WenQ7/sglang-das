@@ -31,6 +31,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.observability.metrics_collector import DPCooperationInfo
 from sglang.srt.runtime_context import get_parallel, get_schedule
+from sglang.srt.sampling.sampling_batch_info import (
+    is_greedy_top1_sampling_eligible,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import require_mlp_tp_gather
@@ -93,49 +96,70 @@ class MLPSyncBatchInfo:
 
     num_tokens: int
     num_tokens_for_logprob: int
+    cp_num_tokens: int
     can_run_decode_cuda_graph: bool
     can_run_prefill_cuda_graph: bool
+    target_verify_greedy_top1_eligible: bool
     is_extend_in_batch: bool
     local_can_run_tbo: bool
     local_forward_mode: int
+    adaptive_accept_sum: int
+    adaptive_request_count: int
+    adaptive_max_local_batch: int
+    adaptive_sync_enabled: bool
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
+    global_cp_num_tokens: list[int] = None
     tbo_split_seq_index: torch.Tensor = None
     global_forward_mode: int = None
     dp_cooperation_info: Optional[DPCooperationInfo] = None
 
     def _get_local_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
-            [
-                self.num_tokens,
-                self.num_tokens_for_logprob,
-                int(self.can_run_decode_cuda_graph),
-                int(self.is_extend_in_batch),
-                int(self.local_can_run_tbo),
-                self.local_forward_mode,
-                int(self.can_run_prefill_cuda_graph),
-            ],
-            device=device,
-            dtype=dtype,
-        )
+        values = [
+            self.num_tokens,
+            self.num_tokens_for_logprob,
+            int(self.can_run_decode_cuda_graph),
+            int(self.is_extend_in_batch),
+            int(self.local_can_run_tbo),
+            self.local_forward_mode,
+            int(self.can_run_prefill_cuda_graph),
+            self.cp_num_tokens,
+            int(self.target_verify_greedy_top1_eligible),
+        ]
+        if self.adaptive_sync_enabled:
+            values.extend(
+                [
+                    self.adaptive_accept_sum,
+                    self.adaptive_request_count,
+                    self.adaptive_max_local_batch,
+                ]
+            )
+        return torch.tensor(values, device=device, dtype=dtype)
 
     def _get_fallback_tensor(self, device, dtype=torch.int64) -> torch.Tensor:
-        return torch.tensor(
-            [
-                0,  # num_tokens
-                0,  # num_tokens_for_logprob
-                1,  # can_run_decode_cuda_graph
-                0,  # is_extend_in_batch
-                1,  # local_can_run_tbo
-                ForwardMode.IDLE.value,  # local_forward_mode
-                0,  # can_run_prefill_cuda_graph
-            ],
-            device=device,
-            dtype=dtype,
-        )
+        values = [
+            0,  # num_tokens
+            0,  # num_tokens_for_logprob
+            1,  # can_run_decode_cuda_graph
+            0,  # is_extend_in_batch
+            1,  # local_can_run_tbo
+            ForwardMode.IDLE.value,  # local_forward_mode
+            0,  # can_run_prefill_cuda_graph
+            0,  # cp_num_tokens
+            1,  # target_verify_greedy_top1_eligible
+        ]
+        if self.adaptive_sync_enabled:
+            values.extend(
+                [
+                    0,  # adaptive_accept_sum
+                    0,  # adaptive_request_count
+                    0,  # adaptive_max_local_batch
+                ]
+            )
+        return torch.tensor(values, device=device, dtype=dtype)
 
     def all_gather(
         self,
@@ -200,9 +224,17 @@ class MLPSyncBatchInfo:
         self.tp0_info_cpu = tp0_info_cpu
         self.global_num_tokens = tp0_info_cpu[:, 0].tolist()
         self.global_num_tokens_for_logprob = tp0_info_cpu[:, 1].tolist()
+        self.global_cp_num_tokens = tp0_info_cpu[:, 7].tolist()
+        if self.cp_size > 1:
+            from sglang.srt.layers.cp.utils import normalize_dp_cp_token_counts
+
+            self.global_cp_num_tokens = normalize_dp_cp_token_counts(
+                self.global_num_tokens, self.global_cp_num_tokens
+            )
         self.can_run_decode_cuda_graph = bool(tp0_info_cpu[:, 2].min())
         self.is_extend_in_batch = bool(tp0_info_cpu[:, 3].max())
         self.can_run_prefill_cuda_graph = bool(tp0_info_cpu[:, 6].min())
+        self.target_verify_greedy_top1_eligible = bool(tp0_info_cpu[:, 8].min())
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 tp0_info_cpu[:, 5].tolist()
@@ -219,11 +251,13 @@ def _update_gather_batch(
     if not require_mlp_tp_gather:
         batch.global_num_tokens = [mlp_sync_info.num_tokens]
         batch.global_num_tokens_for_logprob = [mlp_sync_info.num_tokens_for_logprob]
+        batch.global_cp_num_tokens = [mlp_sync_info.cp_num_tokens]
     else:
         batch.global_num_tokens = mlp_sync_info.global_num_tokens
         batch.global_num_tokens_for_logprob = (
             mlp_sync_info.global_num_tokens_for_logprob
         )
+        batch.global_cp_num_tokens = mlp_sync_info.global_cp_num_tokens
     if not skip_all_gather:
         batch.is_extend_in_batch = mlp_sync_info.is_extend_in_batch
         batch.tbo_split_seq_index = mlp_sync_info.tbo_split_seq_index
@@ -232,6 +266,9 @@ def _update_gather_batch(
     # Check forward mode for cuda graph
     batch.can_run_dp_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
     batch.can_run_dp_breakable_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
+    batch.target_verify_greedy_top1_eligible = (
+        mlp_sync_info.target_verify_greedy_top1_eligible
+    )
 
 
 def prepare_mlp_sync_batch_raw(
@@ -246,6 +283,9 @@ def prepare_mlp_sync_batch_raw(
     require_mlp_tp_gather: bool,
     disable_overlap_schedule: bool,
     offload_tags: set[str],
+    adaptive_stats: tuple[int, int, int] = (0, 0, 0),
+    adaptive_sync_enabled: bool = False,
+    on_adaptive_stats_synchronized: Optional[Callable[[int, int, int], None]] = None,
     dwdp: bool = False,
 ):
     # Check if other DP workers have running batches
@@ -274,6 +314,16 @@ def prepare_mlp_sync_batch_raw(
             or num_tokens_for_logprob == local_batch.batch_size()
         )
 
+    cp_num_tokens = 0
+    if local_batch is not None and local_batch.forward_mode.is_extend():
+        from sglang.srt.layers.cp.utils import get_cp_v2_physical_token_count
+
+        cp_num_tokens = get_cp_v2_physical_token_count(
+            num_tokens=num_tokens,
+            extend_seq_lens=local_batch.extend_lens,
+            cp_size=attn_cp_size,
+        )
+
     # With a single DP replica and no residual attention-TP/MLP-TP gather,
     # every CP rank receives the same work through the CP control broadcast.
     # The scheduler metadata all-gather is therefore redundant and can hang
@@ -287,6 +337,19 @@ def prepare_mlp_sync_batch_raw(
         or local_batch.forward_mode.is_decode_or_idle()
         or local_batch.forward_mode.is_prebuilt()
     ) and not disable_cuda_graph
+    target_verify_greedy_top1_eligible = (
+        local_batch is None
+        or not envs.SGLANG_OPT_USE_EAGLE3_TARGET_LM_HEAD_TOP1.get()
+        or local_batch.spec_algorithm is None
+        or not local_batch.spec_algorithm.is_eagle()
+        or is_greedy_top1_sampling_eligible(
+            local_batch.sampling_info,
+            has_grammar=local_batch.has_grammar,
+            return_logprob=local_batch.return_logprob,
+        )
+    )
+    if not target_verify_greedy_top1_eligible:
+        can_run_decode_cuda_graph = False
     breakable_prefill = check_cuda_graph_backend(Phase.PREFILL, Backend.BREAKABLE)
     prefill_graph_runner = (
         model_runner.prefill_cuda_graph_runner if breakable_prefill else None
@@ -311,7 +374,8 @@ def prepare_mlp_sync_batch_raw(
                     lora_ineligible=prefill_graph_runner.enable_lora,
                     batch_max_context_len=(
                         int(local_batch.seq_lens_cpu.max().item())
-                        if getattr(prefill_graph_runner, "max_context_size", None) is not None
+                        if getattr(prefill_graph_runner, "max_context_size", None)
+                        is not None
                         and local_batch.seq_lens_cpu is not None
                         and local_batch.seq_lens_cpu.numel() > 0
                         else None
@@ -359,11 +423,17 @@ def prepare_mlp_sync_batch_raw(
         cp_size=attn_cp_size,
         num_tokens=num_tokens,
         num_tokens_for_logprob=num_tokens_for_logprob,
+        cp_num_tokens=cp_num_tokens,
         can_run_decode_cuda_graph=can_run_decode_cuda_graph,
         can_run_prefill_cuda_graph=can_run_prefill_cuda_graph,
+        target_verify_greedy_top1_eligible=(target_verify_greedy_top1_eligible),
         is_extend_in_batch=is_extend_in_batch,
         local_can_run_tbo=local_can_run_tbo,
         local_forward_mode=local_forward_mode,
+        adaptive_accept_sum=adaptive_stats[0],
+        adaptive_request_count=adaptive_stats[1],
+        adaptive_max_local_batch=adaptive_stats[2],
+        adaptive_sync_enabled=adaptive_sync_enabled,
     )
 
     if not skip_all_gather:
@@ -378,6 +448,15 @@ def prepare_mlp_sync_batch_raw(
                 mlp_sync_info.tp0_info_cpu[:, 4:6],
             )
         )
+
+        if adaptive_sync_enabled and on_adaptive_stats_synchronized is not None:
+            accepted_sum = int(mlp_sync_info.tp0_info_cpu[:, 9].sum().item())
+            request_count = int(mlp_sync_info.tp0_info_cpu[:, 10].sum().item())
+            max_local_batch = int(mlp_sync_info.tp0_info_cpu[:, 11].max().item())
+            if request_count > 0:
+                on_adaptive_stats_synchronized(
+                    accepted_sum, request_count, max_local_batch
+                )
 
     # Decide whether to emit idle batch
     if skip_all_gather:
@@ -436,6 +515,9 @@ class SchedulerDPAttnAdapter:
         [], Optional[tuple[torch.distributed.ProcessGroup, int, list[int]]]
     ]
     set_dp_scheduler_epoch: Callable[[int], None]
+    take_pending_adaptive_stats: Callable[[], tuple[int, int, int]]
+    on_adaptive_stats_synchronized: Callable[[int, int, int], None]
+    adaptive_sync_enabled: bool
 
     def prepare_mlp_sync_batch(self, local_batch: ScheduleBatch):
         return prepare_mlp_sync_batch_raw(
@@ -450,6 +532,9 @@ class SchedulerDPAttnAdapter:
             require_mlp_tp_gather=require_mlp_tp_gather(self.server_args),
             disable_overlap_schedule=get_schedule().disable_overlap_schedule,
             offload_tags=self.offload_tags,
+            adaptive_stats=self.take_pending_adaptive_stats(),
+            adaptive_sync_enabled=self.adaptive_sync_enabled,
+            on_adaptive_stats_synchronized=self.on_adaptive_stats_synchronized,
             dwdp=get_parallel().dwdp_size > 1,
         )
 

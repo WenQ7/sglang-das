@@ -212,6 +212,15 @@ class QuickAllReduce:
         self.qr_max_size = qr_max_size if qr_max_size > 0 else ops.qr_max_size()
         self.create_shared_buffer()
         self.disabled = False
+        self._logged_first_selection = False
+        logger.info(
+            "QuickReduce initialized: world_size=%d, regime=%s, "
+            "cast_bf16_to_fp16=%s, max_size_bytes=%d",
+            self.world_size,
+            self.qr_quant_level.name,
+            bool(self.use_fp16_kernels),
+            self.qr_max_size,
+        )
 
     def create_shared_buffer(self):
         """
@@ -242,12 +251,19 @@ class QuickAllReduce:
         dtype = inp.dtype
         if self.use_fp16_kernels:
             dtype = torch.float16
-        return (
-            inp_size
-            <= self.qr_max_size
-            # and inp_size
-            # >= self._QR_MIN_SIZE[(dtype, self.world_size)][self.qr_quant_level.value]
-        )
+        selected = inp_size <= self.qr_max_size
+        if selected and not self._logged_first_selection:
+            logger.info(
+                "[AR] QuickReduce selected: bytes=%d, dtype=%s, world_size=%d, "
+                "regime=%s, cast_bf16_to_fp16=%s",
+                inp_size,
+                inp.dtype,
+                self.world_size,
+                self.qr_quant_level.name,
+                bool(self.use_fp16_kernels),
+            )
+            self._logged_first_selection = True
+        return selected
 
     def quick_all_reduce(self, inp: torch.Tensor, *, out: torch.Tensor = None):
         """Performs an out-of-place custom quick all reduce."""

@@ -26,6 +26,7 @@ from sglang.kernels.ops.activation.softcap import (
 )
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStates,
     pack_aux_hidden_states,
@@ -53,6 +54,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardMode,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.sampling.sampling_batch_info import (
+    is_greedy_top1_sampling_eligible,
+)
 from sglang.srt.sampling.sampling_observer import DeviceAuxiliaryOutput
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils.common import (
@@ -73,12 +77,51 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
     "PackWeightMethod",
 }
 
+
+def _blas_backend_name(backend) -> str:
+    """Convert PyTorch's private BLAS enum to its public setter spelling."""
+    return str(backend).rsplit(".", 1)[-1].lower()
+
+
+@contextmanager
+def _temporary_blas_backend(backend: str):
+    """Select one ROCm BLAS backend for a single synchronously-enqueued op."""
+    previous = torch.backends.cuda.preferred_blas_library()
+    previous_name = _blas_backend_name(previous)
+    if previous_name == backend:
+        yield
+        return
+    torch.backends.cuda.preferred_blas_library(backend)
+    try:
+        yield
+    finally:
+        torch.backends.cuda.preferred_blas_library(previous_name)
+
+
 # None outside a FlashInfer autotune pass; inside one, whether that pass runs the
 # LM head. Not-None means the forward's output is discarded -- attention backends
 # read that via get_in_autotune_dummy_run() to skip a cross-node exchange.
 # Skipping the LM head skips its [batch * dp_size, vocab] all-gather, which OOMs
 # under DP attention with a tight mem_fraction_static.
 _autotune_run_lm_head: Optional[bool] = None
+
+
+def is_target_verify_greedy_top1_eligible(forward_batch: ForwardBatch) -> bool:
+    """Whether a target-verify batch can bypass full vocabulary logits.
+
+    CUDA graph capture constructs a synthetic ``ForwardBatch`` without sampling
+    metadata.  Treat that batch as eligible so the direct-Top1 graph can be
+    captured; real replay/eager batches always carry ``SamplingBatchInfo`` and
+    are checked conservatively here.  A mixed batch falls back as a whole.
+    """
+    if not forward_batch.forward_mode.is_target_verify():
+        return False
+    if not getattr(forward_batch, "target_verify_greedy_top1_eligible", True):
+        return False
+    return is_greedy_top1_sampling_eligible(
+        forward_batch.sampling_info,
+        return_logprob=forward_batch.return_logprob,
+    )
 
 
 def get_in_autotune_dummy_run() -> bool:
@@ -107,6 +150,12 @@ class LogitsProcessorOutput:
     # Draft decode VP returns a deterministic top-1 proposal without full logits.
     draft_top1_token_ids: Optional[torch.Tensor] = None
     draft_top1_probs: Optional[torch.Tensor] = None
+    # Greedy EAGLE3 fast path.  When populated, the draft worker consumes
+    # these ids directly and ``next_token_logits`` is intentionally None.
+    draft_topk_index: Optional[torch.Tensor] = None
+    # Greedy target-verify fast path. The target model emits one argmax token
+    # per verify row without materializing ``[rows, vocab]`` logits.
+    target_topk_index: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
@@ -308,6 +357,15 @@ class LogitsProcessor(nn.Module):
         self.use_attn_tp_group = get_parallel().enable_dp_lm_head
         self.use_tp_lm_head_all_to_all = get_parallel().enable_tp_lm_head_all_to_all
         self.use_fp32_lm_head = get_exec().features.enable_fp32_lm_head
+        self.use_hipblaslt_bf16_lm_head = (
+            envs.SGLANG_OPT_USE_HIPBLASLT_BF16_LM_HEAD.get()
+        )
+        self.hipblaslt_bf16_lm_head_min_rows = (
+            envs.SGLANG_HIPBLASLT_BF16_LM_HEAD_MIN_ROWS.get()
+        )
+        self._bf16_lm_head_dispatch_rows_logged = set()
+        if self.hipblaslt_bf16_lm_head_min_rows < 1:
+            raise ValueError("SGLANG_HIPBLASLT_BF16_LM_HEAD_MIN_ROWS must be >= 1")
         if self.use_attn_tp_group:
             self.attn_tp_size = get_parallel().attn_tp_size
             self.do_tensor_parallel_all_gather = (
@@ -466,6 +524,325 @@ class LogitsProcessor(nn.Module):
         )
         logprobs_result.write_input_to(logits_output)
         return logits_output
+
+    def forward_draft_top1_fp8(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: Union[LogitsMetadata, ForwardBatch],
+        fp8_weight: Optional[torch.Tensor],
+        weight_scale: Optional[torch.Tensor],
+        aux_hidden_states: Optional[AuxHiddenStates] = None,
+        backend: str = "lightop",
+    ) -> LogitsProcessorOutput:
+        """Greedy EAGLE3 LM-head without materializing vocabulary logits."""
+        from sglang.kernels.ops.speculative.fp8_lm_head_top1 import (
+            bf16_lm_head_top1_fused,
+            fp8_lm_head_top1,
+            fp8_lm_head_top1_fused,
+        )
+        from sglang.kernels.ops.speculative.topk1 import (
+            draft_topk1_argmax,
+            draft_topk1_select_candidates,
+        )
+
+        if isinstance(logits_metadata, ForwardBatch):
+            logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
+        if logits_metadata.extend_return_logprob:
+            raise RuntimeError("FP8 draft Top-1 does not support input logprobs")
+        if self.final_logit_softcapping is not None:
+            raise RuntimeError("FP8 draft Top-1 does not support logit softcapping")
+        (
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            _,
+            _,
+        ) = self._get_pruned_states(
+            hidden_states,
+            None,
+            aux_hidden_states,
+            logits_metadata,
+        )
+        hidden_states_to_store = self._get_hidden_states_to_store(
+            hidden_states,
+            None,
+            aux_hidden_states,
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            logits_metadata,
+        )
+        pruned_states, local_states = self._gather_dp_attn_hidden_states(
+            pruned_states, logits_metadata
+        )
+
+        shard = lm_head.shard_indices
+        if shard.num_added_elements != 0:
+            raise RuntimeError("FP8 draft Top-1 does not support added vocabulary")
+        valid_local_vocab = shard.org_vocab_end_index - shard.org_vocab_start_index
+        # Large prefill batches are not the intended fused-kernel shape. Keep
+        # the serving path robust by falling back to tuned hipBLASLt instead of
+        # failing a request when an unusual draft batch exceeds the graph set.
+        use_fused_shape = pruned_states.shape[0] <= 8
+        if pruned_states.numel() == 0:
+            # Idle DP ranks still execute the EAGLE draft control flow.  Do
+            # not send their empty [0, K] input to LightOp/hipBLASLt, which
+            # rejects M=0 and logs status=3 on every speculative step.
+            local_values = torch.empty(
+                (0,), dtype=torch.float32, device=pruned_states.device
+            )
+            local_indices = torch.empty(
+                (0,), dtype=torch.int32, device=pruned_states.device
+            )
+        elif backend == "triton_bf16_fused" and use_fused_shape:
+            local_values, local_indices = bf16_lm_head_top1_fused(
+                pruned_states,
+                lm_head.weight,
+                valid_vocab_size=valid_local_vocab,
+            )
+        else:
+            if fp8_weight is None or weight_scale is None:
+                # Unusual M>8 BF16 batches retain correctness through the
+                # ordinary LM-head, because no FP8 fallback weights exist.
+                local_logits = self._compute_lm_head(pruned_states, lm_head)
+                local_values, local_indices = draft_topk1_argmax(
+                    local_logits[:, :valid_local_vocab].contiguous()
+                )
+            else:
+                local_top1_op = (
+                    fp8_lm_head_top1_fused
+                    if backend in ("triton_fused", "triton_fp8_fused")
+                    and use_fused_shape
+                    else fp8_lm_head_top1
+                )
+                local_values, local_indices = local_top1_op(
+                    pruned_states,
+                    fp8_weight,
+                    weight_scale,
+                    valid_vocab_size=valid_local_vocab,
+                )
+        global_ids = local_indices.to(torch.float32).add_(shard.org_vocab_start_index)
+        candidates = torch.stack((local_values, global_ids), dim=-1)
+        if self.do_tensor_parallel_all_gather:
+            if self.use_attn_tp_group:
+                raise RuntimeError(
+                    "FP8 draft Top-1 currently requires the model TP group"
+                )
+            candidates = get_tp_group().all_gather(candidates, dim=-1)
+            candidates = candidates.view(candidates.shape[0], -1, 2)
+            global_top1 = draft_topk1_select_candidates(candidates)
+        else:
+            global_top1 = global_ids.to(torch.int64).view(-1, 1).contiguous()
+        if self.do_tensor_parallel_all_gather_dp_attn:
+            local_top1 = torch.empty(
+                (local_states.shape[0], 1),
+                dtype=torch.int64,
+                device=global_top1.device,
+            )
+            dp_scatter(local_top1, global_top1, logits_metadata)
+        else:
+            local_top1 = global_top1
+        return LogitsProcessorOutput(
+            next_token_logits=None,
+            hidden_states=hidden_states_to_store,
+            draft_topk_index=local_top1,
+            mm_input_embeds=logits_metadata.mm_input_embeds,
+        )
+
+    def forward_target_verify_top1(
+        self,
+        input_ids: torch.Tensor,
+        hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: Union[LogitsMetadata, ForwardBatch],
+        aux_hidden_states: Optional[AuxHiddenStates] = None,
+        fused_min_rows: int = 1,
+        backend: str = "triton_bf16_fused",
+        fp8_weight: Optional[torch.Tensor] = None,
+        fp8_weight_scale: Optional[torch.Tensor] = None,
+        vocab_tp: bool = False,
+    ) -> LogitsProcessorOutput:
+        """Greedy target verify returning only token IDs.
+
+        Keep the output protocol stable while a decode batch drains.  Shapes
+        below ``fused_min_rows`` use the ordinary materialized BF16 LM head and
+        exact argmax. Larger shapes use either the exact BF16 fused kernel or
+        an explicitly selected FP8 backend. Toggling between full-logits and
+        direct-ID outputs at runtime is unsafe because the compiled EAGLE
+        selection path assumes one output schema.
+        """
+        from sglang.kernels.ops.speculative.fp8_lm_head_top1 import (
+            bf16_lm_head_top1_fused,
+            fp8_lm_head_top1,
+            fp8_lm_head_top1_fused,
+        )
+        from sglang.kernels.ops.speculative.topk1 import (
+            draft_topk1_argmax,
+            draft_topk1_select_candidates,
+        )
+
+        if isinstance(logits_metadata, ForwardBatch):
+            logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
+        if not logits_metadata.forward_mode.is_target_verify():
+            raise RuntimeError("target LM-head Top-1 requires TARGET_VERIFY mode")
+        if logits_metadata.extend_return_logprob:
+            raise RuntimeError("target LM-head Top-1 does not support input logprobs")
+        if self.logit_scale is not None and self.logit_scale <= 0:
+            raise RuntimeError("target LM-head Top-1 requires a positive logit scale")
+
+        (
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            _,
+            _,
+        ) = self._get_pruned_states(
+            hidden_states,
+            None,
+            aux_hidden_states,
+            logits_metadata,
+        )
+        hidden_states_to_store = self._get_hidden_states_to_store(
+            hidden_states,
+            None,
+            aux_hidden_states,
+            pruned_states,
+            pruned_states_before_norm,
+            aux_pruned_states,
+            sample_indices,
+            logits_metadata,
+        )
+        if vocab_tp:
+            if getattr(lm_head, "tp_size", None) != 1:
+                raise RuntimeError(
+                    "temporary target vocab TP requires a replicated LM head"
+                )
+            if get_parallel().tp_size != get_parallel().attn_dp_size:
+                raise RuntimeError(
+                    "temporary target vocab TP currently requires "
+                    "tp_size == attention dp_size"
+                )
+            logits_metadata.compute_dp_attention_metadata()
+            local_states = pruned_states
+            pruned_states = logits_metadata.gathered_buffer
+            dp_gather_replicate(pruned_states, local_states, logits_metadata)
+        else:
+            pruned_states, local_states = self._gather_dp_attn_hidden_states(
+                pruned_states, logits_metadata
+            )
+
+        weight = getattr(lm_head, "weight", None)
+        if weight is None or weight.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "target LM-head Top-1 currently requires a BF16 weight, got "
+                f"{getattr(weight, 'dtype', None)}"
+            )
+        if pruned_states.dtype != torch.bfloat16:
+            raise RuntimeError(
+                "target LM-head Top-1 currently requires BF16 hidden states, got "
+                f"{pruned_states.dtype}"
+            )
+        if getattr(lm_head, "bias", None) is not None:
+            raise RuntimeError("target LM-head Top-1 does not support an LM-head bias")
+        shard = lm_head.shard_indices
+        if shard.num_added_elements != 0:
+            raise RuntimeError("target LM-head Top-1 does not support added vocabulary")
+        if vocab_tp:
+            tp_size = get_parallel().tp_size
+            tp_rank = get_parallel().tp_rank
+            if lm_head.num_embeddings_padded % tp_size != 0:
+                raise RuntimeError(
+                    "temporary target vocab TP requires evenly divisible padded vocab"
+                )
+            vocab_per_rank = lm_head.num_embeddings_padded // tp_size
+            shard_start = tp_rank * vocab_per_rank
+            shard_end = shard_start + vocab_per_rank
+            weight = weight[shard_start:shard_end]
+            valid_local_vocab = max(
+                0, min(lm_head.org_vocab_size, shard_end) - shard_start
+            )
+        else:
+            shard_start = shard.org_vocab_start_index
+            valid_local_vocab = shard.org_vocab_end_index - shard_start
+        if pruned_states.shape[0] < fused_min_rows:
+            # ``lm_head`` remains fully replicated for ordinary prefill.  In
+            # temporary vocab-TP mode, materialize only this rank's explicit
+            # weight slice; calling the module here would scan the full vocab
+            # and then incorrectly reinterpret its first shard as every rank's
+            # local vocabulary.
+            local_logits = (
+                torch.nn.functional.linear(pruned_states, weight)
+                if vocab_tp
+                else self._compute_lm_head(pruned_states, lm_head)
+            )
+            local_values, local_indices = draft_topk1_argmax(
+                local_logits[:, :valid_local_vocab].contiguous()
+            )
+        elif backend == "triton_bf16_fused":
+            local_values, local_indices = bf16_lm_head_top1_fused(
+                pruned_states,
+                weight,
+                valid_vocab_size=valid_local_vocab,
+            )
+        elif backend in ("lightop", "lightop_fp8"):
+            if fp8_weight is None or fp8_weight_scale is None:
+                raise RuntimeError("target FP8 LM-head weights were not initialized")
+            local_values, local_indices = fp8_lm_head_top1(
+                pruned_states,
+                fp8_weight,
+                fp8_weight_scale,
+                valid_vocab_size=valid_local_vocab,
+            )
+        elif backend in ("triton_fused", "triton_fp8_fused"):
+            if fp8_weight is None or fp8_weight_scale is None:
+                raise RuntimeError("target FP8 LM-head weights were not initialized")
+            local_values, local_indices = fp8_lm_head_top1_fused(
+                pruned_states,
+                fp8_weight,
+                fp8_weight_scale,
+                valid_vocab_size=valid_local_vocab,
+            )
+        else:
+            raise RuntimeError(
+                "unsupported target LM-head Top-1 backend " f"{backend!r}"
+            )
+        global_ids = local_indices.to(torch.float32).add_(shard_start)
+        if vocab_tp or self.do_tensor_parallel_all_gather:
+            candidates = torch.stack((local_values, global_ids), dim=-1)
+            tp_group = (
+                get_tp_group()
+                if vocab_tp
+                else (
+                    get_parallel().attn_tp_group
+                    if self.use_attn_tp_group
+                    else get_tp_group()
+                )
+            )
+            candidates = tp_group.all_gather(candidates, dim=-1)
+            candidates = candidates.view(candidates.shape[0], -1, 2)
+            global_top1 = draft_topk1_select_candidates(candidates)
+        else:
+            global_top1 = global_ids.to(torch.int64).view(-1, 1).contiguous()
+        if vocab_tp or self.do_tensor_parallel_all_gather_dp_attn:
+            local_top1 = torch.empty(
+                (local_states.shape[0], 1),
+                dtype=torch.int64,
+                device=global_top1.device,
+            )
+            dp_scatter(local_top1, global_top1, logits_metadata)
+        else:
+            local_top1 = global_top1
+        return LogitsProcessorOutput(
+            next_token_logits=None,
+            hidden_states=hidden_states_to_store,
+            target_topk_index=local_top1,
+            mm_input_embeds=logits_metadata.mm_input_embeds,
+        )
 
     def _get_pruned_states(
         self,
@@ -704,7 +1081,12 @@ class LogitsProcessor(nn.Module):
             hidden_states, logits_metadata
         )
 
-        logits = self._compute_lm_head(hidden_states, lm_head, embedding_bias)
+        logits = self._compute_lm_head(
+            hidden_states,
+            lm_head,
+            embedding_bias,
+            allow_hipblaslt_bf16=(logits_metadata.forward_mode.is_target_verify()),
+        )
 
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
@@ -745,7 +1127,22 @@ class LogitsProcessor(nn.Module):
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
         embedding_bias: Optional[torch.Tensor] = None,
+        *,
+        allow_hipblaslt_bf16: bool = False,
     ) -> torch.Tensor:
+        # An idle DP-attention rank can legitimately reach the ordinary
+        # full-logits fallback with no rows.  hipBLASLt rejects M=0 and emits
+        # a noisy status=3 even though the empty result is well-defined.
+        # Preserve the normal output shape/dtype without launching a GEMM.
+        weight = getattr(lm_head, "weight", None)
+        if hidden_states.numel() == 0 and weight is not None:
+            output_dtype = torch.float32 if self.use_fp32_lm_head else weight.dtype
+            return torch.empty(
+                (*hidden_states.shape[:-1], weight.shape[0]),
+                dtype=output_dtype,
+                device=hidden_states.device,
+            )
+
         quant_method = getattr(lm_head, "quant_method", None)
         if hasattr(lm_head, "set_lora") and hasattr(lm_head, "apply_lora"):
             # This is a LoRA-wrapped module, use its forward method
@@ -787,9 +1184,35 @@ class LogitsProcessor(nn.Module):
                     hidden_states.bfloat16(), lm_head.weight.T.bfloat16()
                 )
             else:
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
+                hidden_states = hidden_states.to(lm_head.weight.dtype)
+                num_rows = hidden_states.numel() // hidden_states.shape[-1]
+                use_hipblaslt = (
+                    getattr(self, "use_hipblaslt_bf16_lm_head", False)
+                    and allow_hipblaslt_bf16
+                    and torch.version.hip is not None
+                    and hidden_states.is_cuda
+                    and hidden_states.dtype == torch.bfloat16
+                    and lm_head.weight.dtype == torch.bfloat16
+                    and num_rows >= self.hipblaslt_bf16_lm_head_min_rows
                 )
+                if (
+                    getattr(self, "use_hipblaslt_bf16_lm_head", False)
+                    and allow_hipblaslt_bf16
+                    and num_rows not in self._bf16_lm_head_dispatch_rows_logged
+                ):
+                    self._bf16_lm_head_dispatch_rows_logged.add(num_rows)
+                    logger.info(
+                        "Target verify BF16 LM-head dispatch: M=%d backend=%s "
+                        "(hipBLASLt min_rows=%d)",
+                        num_rows,
+                        "hipBLASLt" if use_hipblaslt else "hipBLAS",
+                        self.hipblaslt_bf16_lm_head_min_rows,
+                    )
+                if use_hipblaslt:
+                    with _temporary_blas_backend("cublaslt"):
+                        logits = torch.matmul(hidden_states, lm_head.weight.T)
+                else:
+                    logits = torch.matmul(hidden_states, lm_head.weight.T)
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models

@@ -1,6 +1,7 @@
 # Copyright 2025 XunhaoLai. All rights reserved.
 
-from typing import Optional
+import os
+from typing import Optional, Tuple, Union
 
 import torch
 import triton
@@ -57,6 +58,8 @@ def _gqa_share_sparse_decode_kernel(
     # per-tensor KV dequant scales (1.0 when the cache is unit-scaled)
     k_scale,
     v_scale,
+    # Scale softmax probabilities into the useful e4m3 range before FP8 PV.
+    p_scale,
     # stride
     stride_q_b,
     stride_q_h,
@@ -89,6 +92,8 @@ def _gqa_share_sparse_decode_kernel(
     NUM_TOPK_CHUNKS: tl.constexpr,
     HAS_SINK: tl.constexpr,
     IS_FP8: tl.constexpr,
+    DCP_SIZE: tl.constexpr,
+    DCP_RANK: tl.constexpr,
 ):
     # decode program ids: split-K over the topk dimension to give every SM
     # something to do at small batch. pid(0) folds (batch, chunk) together so
@@ -173,6 +178,9 @@ def _gqa_share_sparse_decode_kernel(
             mask=pos_mask,
             other=0,
         ).to(tl.int64)
+        if DCP_SIZE > 1:
+            pos_mask = pos_mask & (pos % DCP_SIZE == DCP_RANK)
+            slots = slots // DCP_SIZE
         slots = (slots + max_slots) % max_slots  # safety against negative
         # load K as (head_dim, BLOCK_SIZE_N) via indirect addressing
         k_off = (
@@ -212,22 +220,38 @@ def _gqa_share_sparse_decode_kernel(
             v = v.to(q.dtype)
         # compute qk
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_N), dtype=tl.float32)
-        qk += tl.where(off_n[None, :] < seq_len - c, 0, float("-inf"))
+        if DCP_SIZE > 1:
+            qk += tl.where(pos_mask[None, :], 0, float("-inf"))
+        else:
+            qk += tl.where(off_n[None, :] < seq_len - c, 0, float("-inf"))
         # [H, D], [D, N] -> [H, N]
         qk += tl.dot(q, k) * (sm_scale * k_scale)
         # compute m_ij and l_ij
         m_ij = tl.maximum(m_i, tl.max(qk, axis=1))
-        p = tl.exp(qk - m_ij[:, None])
+        if DCP_SIZE > 1:
+            has_value = m_ij > float("-inf")
+            safe_m_ij = tl.where(has_value, m_ij, 0.0)
+            p = tl.where(qk > float("-inf"), tl.exp(qk - safe_m_ij[:, None]), 0.0)
+            acc_o_scale = tl.where(m_i > float("-inf"), tl.exp(m_i - safe_m_ij), 0.0)
+        else:
+            p = tl.exp(qk - m_ij[:, None])
+            acc_o_scale = tl.exp(m_i - m_ij)
         l_ij = tl.sum(p, axis=1)
         # scale acc_o
-        acc_o_scale = tl.exp(m_i - m_ij)
         acc_o = acc_o * acc_o_scale[:, None]
         # load v and update acc_o
         # [H, N], [N, D] -> [H, D]
-        acc_o += tl.dot(p.to(v.dtype), v) * v_scale
+        acc_o += tl.dot((p * p_scale).to(v.dtype), v) * (v_scale / p_scale)
         # update statistics
-        m_i = m_ij
-        lse_i = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
+        if DCP_SIZE > 1:
+            lse_sum = (
+                tl.where(lse_i > float("-inf"), tl.exp(lse_i - safe_m_ij), 0.0) + l_ij
+            )
+            m_i = tl.where(has_value, m_ij, float("-inf"))
+            lse_i = tl.where(has_value, safe_m_ij + tl.log(lse_sum), float("-inf"))
+        else:
+            m_i = m_ij
+            lse_i = m_ij + tl.log(tl.exp(lse_i - m_ij) + l_ij)
     # final scale (matches the old non-split kernel for chunks where lse_i>-inf).
     # For empty chunks (chunk_start_topk >= real_topk) the inner loop never
     # runs, so m_i = lse_i = -inf and naive `tl.exp(m_i - lse_i)` would compute
@@ -298,11 +322,347 @@ def _merge_topk_attn_out_kernel(
     # standard flash-decoding merge in linear (not log2) space, matching the
     # decode kernel which uses tl.exp / tl.log.
     lse_max = tl.max(lse, axis=0)
-    weights = tl.exp(lse - lse_max)
-    weights = weights / tl.sum(weights, axis=0)
+    has_value = lse_max > float("-inf")
+    safe_lse_max = tl.where(has_value, lse_max, 0.0)
+    weights = tl.where(has_value, tl.exp(lse - safe_lse_max), 0.0)
+    weight_sum = tl.sum(weights, axis=0)
+    weights = tl.where(has_value, weights / weight_sum, 0.0)
     o_merged = tl.sum(o * weights[:, None], axis=0)
     o_out_ptrs = o_ptr + pid_b * stride_o_b + pid_h * stride_o_h + off_d * stride_o_d
     tl.store(o_out_ptrs, o_merged.to(o_ptr.dtype.element_ty), mask=off_d < head_dim)
+    # Preserve the merged natural-log LSE in chunk zero for optional DCP
+    # cross-rank output merging. Existing callers that only consume O are
+    # unchanged.
+    tl.store(
+        lse_ptr + pid_b * stride_l_b + pid_h * stride_l_h,
+        tl.where(has_value, safe_lse_max + tl.log(weight_sum), float("-inf")),
+    )
+
+
+@triton.jit
+def _gqa_share_sparse_multi_q_fused_kernel(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    req_to_token_ptr,
+    idx_ptr,
+    o_ptr,
+    lse_ptr,
+    seq_lens_ptr,
+    slot_ids_ptr,
+    max_slots,
+    request_batch_size,
+    gqa_group_size,
+    head_dim,
+    max_kv_len,
+    sm_scale,
+    k_scale,
+    v_scale,
+    p_scale,
+    stride_q_b,
+    stride_q_h,
+    stride_q_d,
+    stride_k_s,
+    stride_k_h,
+    stride_k_d,
+    stride_v_s,
+    stride_v_h,
+    stride_v_d,
+    stride_r2t_b,
+    stride_ti_h,
+    stride_ti_b,
+    stride_ti_t,
+    stride_o_c,
+    stride_o_b,
+    stride_o_h,
+    stride_o_d,
+    stride_l_c,
+    stride_l_b,
+    stride_l_h,
+    BLOCK_SIZE_H: tl.constexpr,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_D: tl.constexpr,
+    TOPK: tl.constexpr,
+    VERIFY_GROUP_SIZE: tl.constexpr,
+    FLAT_TOPK_SIZE: tl.constexpr,
+    UNION_CHUNK_SIZE: tl.constexpr,
+    IS_FP8: tl.constexpr,
+):
+    """Exact sparse Stage3 for a request's speculative query group.
+
+    The old grouped-main experiment materialized a max-context-sized
+    membership bitmap and launched separate scatter/compact kernels.  That was
+    profitable only at very large local batch.  This kernel instead sorts the
+    at-most 64 Top-K ids in registers, detects duplicates in place, and uses a
+    per-query membership predicate while the selected K/V tile is resident.
+    """
+
+    pid_rc = tl.program_id(0)
+    pid_r = pid_rc % request_batch_size
+    pid_c = pid_rc // request_batch_size
+    pid_kh = tl.program_id(1)
+
+    off_h = tl.arange(0, BLOCK_SIZE_H)
+    off_n = tl.arange(0, BLOCK_SIZE_N)
+    off_d = tl.arange(0, BLOCK_SIZE_D)
+    off_t = tl.arange(0, FLAT_TOPK_SIZE)
+
+    verify_idx = off_h // gqa_group_size
+    head_in_group = off_h % gqa_group_size
+    valid_row = verify_idx < VERIFY_GROUP_SIZE
+    flat_b = pid_r * VERIFY_GROUP_SIZE + verify_idx
+    q_head = pid_kh * gqa_group_size + head_in_group
+
+    row_seq_lens = tl.minimum(
+        tl.load(seq_lens_ptr + flat_b, mask=valid_row, other=0).to(tl.int32),
+        max_kv_len,
+    )
+    q = tl.load(
+        q_ptr
+        + flat_b[:, None] * stride_q_b
+        + q_head[:, None] * stride_q_h
+        + off_d[None, :] * stride_q_d,
+        mask=valid_row[:, None] & (off_d[None, :] < head_dim),
+        other=0.0,
+    )
+
+    topk_row = off_t // TOPK
+    topk_col = off_t % TOPK
+    valid_topk_lane = topk_row < VERIFY_GROUP_SIZE
+    flat_topk = tl.load(
+        idx_ptr
+        + pid_kh * stride_ti_h
+        + (pid_r * VERIFY_GROUP_SIZE + topk_row) * stride_ti_b
+        + topk_col * stride_ti_t,
+        mask=valid_topk_lane,
+        other=-1,
+    ).to(tl.int32)
+    # -1 sentinels sort before valid non-negative block ids.  Valid candidates
+    # therefore remain globally ascending, preserving each Q1 kernel's block
+    # accumulation order after duplicates are removed.
+    sorted_topk = tl.sort(flat_topk, dim=0, descending=False)
+
+    dim_mask = off_d < head_dim
+    m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
+    lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
+    acc_o = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_D), dtype=tl.float32)
+    sid = (
+        tl.load(slot_ids_ptr + pid_r * VERIFY_GROUP_SIZE).to(tl.int64) + max_slots
+    ) % max_slots
+    r2t_base = req_to_token_ptr + sid * stride_r2t_b
+
+    chunk_start = pid_c * UNION_CHUNK_SIZE
+    previous_from_sort = tl.sum(
+        tl.where(off_t == chunk_start - 1, sorted_topk, 0), axis=0
+    ).to(tl.int32)
+    previous = tl.where(chunk_start > 0, previous_from_sort, -2)
+    for chunk_offset in tl.static_range(0, UNION_CHUNK_SIZE):
+        union_pos = chunk_start + chunk_offset
+        candidate = tl.sum(tl.where(off_t == union_pos, sorted_topk, 0), axis=0).to(
+            tl.int32
+        )
+        unique_candidate = (candidate >= 0) & (candidate != previous)
+        previous = candidate
+
+        # Membership is exact even when Top-K order differs between queries.
+        # The comparison is register-only; no max-context bitmap/workspace is
+        # constructed and no metadata kernel is launched.
+        member = (
+            tl.sum(
+                (
+                    (flat_topk[None, :] == candidate)
+                    & valid_topk_lane[None, :]
+                    & (topk_row[None, :] == verify_idx[:, None])
+                ).to(tl.int32),
+                axis=1,
+            )
+            > 0
+        )
+
+        safe_candidate = tl.where(unique_candidate, candidate, 0)
+        positions = safe_candidate * BLOCK_SIZE_N + off_n
+        pos_mask = unique_candidate & (positions < max_kv_len)
+        slots = tl.load(r2t_base + positions, mask=pos_mask, other=0).to(tl.int64)
+        slots = (slots + max_slots) % max_slots
+        k = tl.load(
+            k_cache_ptr
+            + slots[None, :] * stride_k_s
+            + pid_kh * stride_k_h
+            + off_d[:, None] * stride_k_d,
+            mask=dim_mask[:, None] & pos_mask[None, :],
+            other=0.0,
+        )
+        v = tl.load(
+            v_cache_ptr
+            + slots[:, None] * stride_v_s
+            + pid_kh * stride_v_h
+            + off_d[None, :] * stride_v_d,
+            mask=pos_mask[:, None] & dim_mask[None, :],
+            other=0.0,
+        )
+        if IS_FP8:
+            k = k.to(q.dtype)
+            v = v.to(q.dtype)
+
+        causal = (
+            valid_row[:, None]
+            & member[:, None]
+            & pos_mask[None, :]
+            & (positions[None, :] < row_seq_lens[:, None])
+        )
+        qk = tl.dot(q, k) * (sm_scale * k_scale)
+        qk = tl.where(causal, qk, float("-inf"))
+        block_m = tl.max(qk, axis=1)
+        m_ij = tl.maximum(m_i, block_m)
+        has_current = block_m > float("-inf")
+        has_any = m_ij > float("-inf")
+        safe_m = tl.where(has_any, m_ij, 0.0)
+        p = tl.where(qk > float("-inf"), tl.exp(qk - safe_m[:, None]), 0.0)
+        acc_scale = tl.where(m_i > float("-inf"), tl.exp(m_i - safe_m), 0.0)
+        l_ij = tl.sum(p, axis=1)
+        acc_o = acc_o * acc_scale[:, None]
+        acc_o += tl.dot((p * p_scale).to(v.dtype), v) * (v_scale / p_scale)
+        lse_sum = tl.where(lse_i > float("-inf"), tl.exp(lse_i - safe_m), 0.0) + l_ij
+        m_i = tl.where(has_current, m_ij, m_i)
+        lse_i = tl.where(has_current, safe_m + tl.log(lse_sum), lse_i)
+
+    has_value = lse_i > float("-inf")
+    acc_o *= tl.where(has_value, tl.exp(m_i - lse_i), 0.0)[:, None]
+    tl.store(
+        o_ptr
+        + pid_c * stride_o_c
+        + flat_b[:, None] * stride_o_b
+        + q_head[:, None] * stride_o_h
+        + off_d[None, :] * stride_o_d,
+        acc_o.to(o_ptr.dtype.element_ty),
+        mask=valid_row[:, None] & (off_d[None, :] < head_dim),
+    )
+    tl.store(
+        lse_ptr + pid_c * stride_l_c + flat_b * stride_l_b + q_head * stride_l_h,
+        lse_i,
+        mask=valid_row,
+    )
+
+
+@torch.no_grad()
+def _flash_decode_multi_q_fused(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    req_to_token: torch.Tensor,
+    seq_lens: torch.Tensor,
+    slot_ids: torch.Tensor,
+    block_size: int,
+    topk_idx: torch.Tensor,
+    sm_scale: float,
+    k_scale: float,
+    v_scale: float,
+    p_scale: float,
+    query_tile_size: int,
+    return_lse: bool,
+    is_fp8: bool,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    flat_batch, num_q_heads, head_dim = q.shape
+    num_kv_heads = k_cache.shape[1]
+    request_batch = flat_batch // query_tile_size
+    gqa_group_size = num_q_heads // num_kv_heads
+    flat_topk_size = triton.next_power_of_2(query_tile_size * topk_idx.shape[2])
+    block_size_h = max(16, triton.next_power_of_2(gqa_group_size * query_tile_size))
+    target_grid = 256
+    target_chunks = max(
+        1,
+        min(
+            topk_idx.shape[2],
+            # Match the Q1 producer's split count. Each fused CTA owns two Q
+            # rows, so matching its CTA count would duplicate sort/partial
+            # work and over-split the union at the winner's local batch.
+            target_grid // max(1, flat_batch * num_kv_heads),
+        ),
+    )
+    num_union_chunks = 1 << (target_chunks.bit_length() - 1)
+    union_chunk_size = flat_topk_size // num_union_chunks
+    out_partial = torch.empty(
+        (num_union_chunks, flat_batch, num_q_heads, v_cache.shape[-1]),
+        dtype=sparse_out_dtype(q),
+        device=q.device,
+    )
+    lse_partial = torch.empty(
+        (num_union_chunks, flat_batch, num_q_heads),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    _gqa_share_sparse_multi_q_fused_kernel[
+        (
+            request_batch * num_union_chunks,
+            num_kv_heads,
+        )
+    ](
+        q,
+        k_cache,
+        v_cache,
+        req_to_token,
+        topk_idx,
+        out_partial,
+        lse_partial,
+        seq_lens,
+        slot_ids,
+        k_cache.shape[0],
+        request_batch,
+        gqa_group_size,
+        head_dim,
+        req_to_token.shape[1],
+        sm_scale,
+        k_scale,
+        v_scale,
+        p_scale,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
+        req_to_token.stride(0),
+        topk_idx.stride(0),
+        topk_idx.stride(1),
+        topk_idx.stride(2),
+        out_partial.stride(0),
+        out_partial.stride(1),
+        out_partial.stride(2),
+        out_partial.stride(3),
+        lse_partial.stride(0),
+        lse_partial.stride(1),
+        lse_partial.stride(2),
+        BLOCK_SIZE_H=block_size_h,
+        BLOCK_SIZE_N=block_size,
+        BLOCK_SIZE_D=triton.next_power_of_2(head_dim),
+        TOPK=topk_idx.shape[2],
+        VERIFY_GROUP_SIZE=query_tile_size,
+        FLAT_TOPK_SIZE=flat_topk_size,
+        UNION_CHUNK_SIZE=union_chunk_size,
+        IS_FP8=is_fp8,
+        num_warps=8,
+        num_stages=1,
+    )
+    _merge_topk_attn_out_kernel[(flat_batch, num_q_heads)](
+        out_partial,
+        lse_partial,
+        head_dim,
+        out_partial.stride(0),
+        out_partial.stride(1),
+        out_partial.stride(2),
+        out_partial.stride(3),
+        lse_partial.stride(0),
+        lse_partial.stride(1),
+        lse_partial.stride(2),
+        NUM_TOPK_CHUNKS=num_union_chunks,
+    )
+    out = out_partial[0].contiguous()
+    if return_lse:
+        return out, lse_partial[0].contiguous()
+    return out
 
 
 @torch.no_grad()
@@ -321,11 +681,26 @@ def flash_decode_with_gqa_share_sparse(
     q_scale: Optional[float] = None,
     k_scale: Optional[float] = None,
     v_scale: Optional[float] = None,
-) -> torch.Tensor:
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
+    return_lse: bool = False,
+    verify_group_size: int = 1,
+    use_multi_q_main: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     triton.set_allocator(robust_allocator)
     is_fp8 = check_sparse_kv_fp8(q, k_cache, v_cache, label="decode")
     k_scale = unit_scale(k_scale)
     v_scale = unit_scale(v_scale)
+    p_scale = (
+        float(os.environ.get("SGLANG_M3_TRITON_FP8_P_SCALE", "448"))
+        if q.dtype == torch.float8_e4m3fn
+        else 1.0
+    )
+    if q.dtype == torch.float8_e4m3fn and not (0.0 < p_scale <= 448.0):
+        raise ValueError(
+            "SGLANG_M3_TRITON_FP8_P_SCALE must be in (0, 448] for e4m3fn, "
+            f"got {p_scale}"
+        )
     # shape
     batch_size, num_q_heads, head_dim = q.shape
     max_slots, num_kv_heads, _ = k_cache.shape
@@ -346,6 +721,40 @@ def flash_decode_with_gqa_share_sparse(
     # q_scale multiplies every Q-side logit (QK dot and sink), so it folds into
     # sm_scale; k_scale must not touch the sink term and stays a kernel arg.
     sm_scale = sm_scale * unit_scale(q_scale)
+    if (
+        use_multi_q_main
+        and verify_group_size in (2, 4)
+        and batch_size % verify_group_size == 0
+        and dcp_size == 1
+        and sink is None
+        and max_topk <= 16
+        and head_dim == 128
+        and v_cache.shape[-1] == 128
+        and block_size == 128
+        and gqa_group_size * 2 <= 64
+    ):
+        # Q4 is intentionally two adjacent Q2 tiles.  A single Q4/GQA16 CTA
+        # creates a 64-row accumulator and made LLVM spend minutes optimizing
+        # a multi-GiB compilation unit on gfx938.  Q2 preserves the most local
+        # speculative-position KV reuse while keeping the production kernel
+        # at 32 rows; the two pairs remain inside their original request.
+        return _flash_decode_multi_q_fused(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            req_to_token=req_to_token,
+            seq_lens=seq_lens,
+            slot_ids=slot_ids,
+            block_size=block_size,
+            topk_idx=topk_idx,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            p_scale=p_scale,
+            query_tile_size=2,
+            return_lse=return_lse,
+            is_fp8=is_fp8,
+        )
     # Pick NUM_TOPK_CHUNKS so total grid ≈ TARGET_GRID. Same constraints as
     # flash_decode_with_topk_idx: must be power of 2 (Triton arange) and must
     # only depend on shape constants (so grid is fixed within a cuda graph).
@@ -356,6 +765,15 @@ def flash_decode_with_gqa_share_sparse(
         1,
         min(max_topk, TARGET_GRID // max(1, batch_size * num_kv_heads)),
     )
+    if verify_group_size > 1:
+        override = os.environ.get("SGLANG_MINIMAX_MTP_NUM_TOPK_CHUNKS")
+        if override is not None:
+            try:
+                requested = int(override)
+            except ValueError:
+                requested = 0
+            if requested > 0:
+                target = min(max_topk, requested)
     NUM_TOPK_CHUNKS = 1 << (target.bit_length() - 1)
     # output tensor: split-K partials, merged into chunk 0 by the merge kernel
     o_partial = torch.empty(
@@ -395,6 +813,7 @@ def flash_decode_with_gqa_share_sparse(
         sm_scale,
         k_scale,
         v_scale,
+        p_scale,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -420,7 +839,14 @@ def flash_decode_with_gqa_share_sparse(
         BLOCK_SIZE_N=block_size,
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
         IS_FP8=is_fp8,
+        DCP_SIZE=dcp_size,
+        DCP_RANK=dcp_rank,
     )
+    if NUM_TOPK_CHUNKS == 1:
+        output = o_partial[0]
+        if return_lse:
+            return output, lse_partial[0]
+        return output
     # merge partials into chunk 0
     merge_grid = (batch_size, num_q_heads)
     _merge_topk_attn_out_kernel[merge_grid](
@@ -436,4 +862,7 @@ def flash_decode_with_gqa_share_sparse(
         lse_partial.stride(2),
         NUM_TOPK_CHUNKS=NUM_TOPK_CHUNKS,
     )
-    return o_partial[0].contiguous()
+    output = o_partial[0].contiguous()
+    if return_lse:
+        return output, lse_partial[0].contiguous()
+    return output

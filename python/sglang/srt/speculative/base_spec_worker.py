@@ -336,6 +336,20 @@ class BaseSpecWorker(ABC):
         """
         pass
 
+    def take_pending_adaptive_stats(self) -> tuple[int, int, int]:
+        """Return and clear local post-verify stats for the next DP sync.
+
+        The tuple is ``(accepted_draft_sum, request_count, max_local_batch)``.
+        Non-adaptive workers contribute zeros.
+        """
+        return 0, 0, 0
+
+    def on_adaptive_stats_synchronized(
+        self, accepted_draft_sum: int, request_count: int, max_local_batch: int
+    ) -> None:
+        """Consume execution-group stats gathered by the scheduler DP sync."""
+        pass
+
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         """Hook called by the batch-result processor when a request finishes.
 

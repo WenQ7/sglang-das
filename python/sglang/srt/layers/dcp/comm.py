@@ -85,6 +85,7 @@ def cp_lse_ag_out_rs_mha(
     cp_attn_lse: torch.Tensor,
     cp_group: GroupCoordinator,
     return_lse: bool = False,
+    use_reduce_scatter: bool = False,
 ):
     if cp_group.world_size == 1:
         return (cp_attn_out, cp_attn_lse) if return_lse else cp_attn_out
@@ -97,13 +98,20 @@ def cp_lse_ag_out_rs_mha(
 
     out = cp_attn_out.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
     out.mul_(scale)
-    out = cp_group.all_reduce(out)
 
     cp_num_heads = global_lse.shape[1] // cp_group.world_size
     cp_rank = cp_group.rank_in_group
     head_start = cp_num_heads * cp_rank
     head_end = cp_num_heads * (cp_rank + 1)
-    out = out[:, head_start:head_end, :].contiguous()
+    if use_reduce_scatter:
+        # The gathered Q heads are rank-major and therefore already partitioned
+        # into the exact contiguous head chunks each rank needs. Reduce-scatter
+        # is mathematically identical to all-reduce + local head slicing while
+        # avoiding communication/materialization of the discarded head chunks.
+        out = cp_group.reduce_scatter_along_dim(out, dim=1)
+    else:
+        out = cp_group.all_reduce(out)
+        out = out[:, head_start:head_end, :].contiguous()
     if return_lse:
         return out, global_lse[:, head_start:head_end].contiguous()
     return out
