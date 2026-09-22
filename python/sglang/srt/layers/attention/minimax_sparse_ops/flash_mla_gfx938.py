@@ -8,6 +8,7 @@ remain in SGLang because they encode serving metadata and MiniMax semantics.
 from __future__ import annotations
 
 import functools
+import os
 from typing import Optional
 
 import torch
@@ -19,6 +20,43 @@ from sglang.kernels.ops.attention.minimax_sparse.common.utils import unit_scale
 
 class FlashMLAGfx938UnavailableError(RuntimeError):
     """The opt-in gfx938 FlashMLA path cannot satisfy its runtime contract."""
+
+
+def _debug_mode() -> str:
+    return os.environ.get("SGLANG_MINIMAX_FLASH_MLA_DEBUG_SYNC", "off").lower()
+
+
+def _debug_sync(stage: str) -> None:
+    """Attribute asynchronous faults to one FlashMLA adapter boundary.
+
+    ``stage`` mode deliberately serializes launches and is diagnostic only.
+    ``boundary`` is handled by the CP caller so its two segment streams remain
+    concurrent.
+    """
+    if _debug_mode() not in ("stage", "all"):
+        return
+    try:
+        torch.cuda.current_stream().synchronize()
+    except Exception as err:
+        raise RuntimeError(
+            f"MiniMax FlashMLA asynchronous failure after {stage}"
+        ) from err
+
+
+def _debug_validate_index_range(
+    tensor: torch.Tensor, *, upper: int, stage: str
+) -> None:
+    if _debug_mode() not in ("stage", "all") or tensor.numel() == 0:
+        return
+    invalid = tensor.lt(-1) | tensor.ge(int(upper))
+    if bool(invalid.any().item()):
+        bad = tensor[invalid]
+        raise RuntimeError(
+            "MiniMax FlashMLA invalid index after "
+            f"{stage}: valid=[-1,{int(upper) - 1}], "
+            f"min={int(bad.min().item())}, max={int(bad.max().item())}, "
+            f"count={int(bad.numel())}, shape={tuple(tensor.shape)}"
+        )
 
 
 @functools.lru_cache(maxsize=1)
@@ -210,7 +248,9 @@ def _run_flash_mla_indexer(
         kv_indices=safe_pages,
         k_end=k_end.to(torch.int32),
     )
+    _debug_sync("prefill Stage1")
     _force_local_pages(score, k_end, block_size, local_blocks)
+    _debug_sync("prefill forced-local-page update")
     # Stage-2 can force common prefix pages directly.  Local pages are
     # query-dependent and were marked above.
     selected = stage2(
@@ -219,6 +259,10 @@ def _run_flash_mla_indexer(
         num_valid_pages=max_pages,
         force_begin_blocks=init_blocks,
         force_end_blocks=0,
+    )
+    _debug_sync("prefill Stage2")
+    _debug_validate_index_range(
+        selected, upper=max_pages, stage="prefill Stage2"
     )
     # Preserve the established SGLang contract [index_head, query, TopK].
     return selected.permute(1, 0, 2)
@@ -428,6 +472,22 @@ def flash_mla_sparse_prefill_main(
     """Run packed prefill through FlashMLA after the native MiniMax indexer."""
     flash_mla_sparse_fwd, _, _, expand, *_ = _load_flash_mla()
     _validate_contract(q, k_cache, v_cache, topk_idx, page_table, block_size_k)
+    batch = int(cu_seqlens.numel()) - 1
+    if page_table.shape[0] != batch:
+        raise FlashMLAGfx938UnavailableError(
+            "FlashMLA prefill page-table/query batch mismatch: "
+            f"page_table={tuple(page_table.shape)}, packed_batch={batch}"
+        )
+    if (
+        seq_lens.numel() != batch
+        or prefix_lens.numel() != batch
+        or int(cu_seqlens.numel()) != batch + 1
+    ):
+        raise FlashMLAGfx938UnavailableError(
+            "FlashMLA prefill ragged metadata mismatch: "
+            f"batch={batch}, seq_lens={seq_lens.numel()}, "
+            f"prefix_lens={prefix_lens.numel()}, cu={cu_seqlens.numel()}"
+        )
     if topk_idx.shape[0] != 4 or topk_idx.shape[1] != q.shape[0]:
         raise FlashMLAGfx938UnavailableError(
             "FlashMLA prefill needs one exact Top16 row per query and KV head, "
@@ -444,6 +504,10 @@ def flash_mla_sparse_prefill_main(
         output=indices_output,
         s_q_axis=0,
     )
+    _debug_sync("prefill block-to-token expand")
+    _debug_validate_index_range(
+        indices, upper=k_cache.shape[0], stage="prefill block-to-token expand"
+    )
     scale = (128**-0.5 if sm_scale is None else sm_scale) * unit_scale(
         q_scale
     ) * unit_scale(k_scale)
@@ -455,6 +519,7 @@ def flash_mla_sparse_prefill_main(
         d_v=128,
         v=v_cache,
     )
+    _debug_sync("prefill Stage3")
     value_scale = unit_scale(v_scale)
     return output if value_scale == 1.0 else output * value_scale
 

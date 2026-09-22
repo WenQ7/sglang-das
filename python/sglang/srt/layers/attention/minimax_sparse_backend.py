@@ -3147,6 +3147,28 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                                 )
                         for stream in streams:
                             current_stream.wait_stream(stream)
+                        # The segment outputs are allocated on their auxiliary
+                        # streams but consumed by the concatenation below on
+                        # the current stream.  Waiting establishes execution
+                        # order; record_stream additionally prevents the CUDA
+                        # caching allocator from recycling an auxiliary-stream
+                        # allocation before the current-stream consumer has
+                        # finished reading it.  This matters under the high
+                        # allocator pressure of FlashMLA's score/index buffers.
+                        for idx_part, out_part in segment_outputs:
+                            out_part.record_stream(current_stream)
+                            if idx_part is not None:
+                                idx_part.record_stream(current_stream)
+                        if os.environ.get(
+                            "SGLANG_MINIMAX_FLASH_MLA_DEBUG_SYNC", "off"
+                        ).lower() in ("boundary", "all"):
+                            try:
+                                current_stream.synchronize()
+                            except Exception as err:
+                                raise RuntimeError(
+                                    "MiniMax FlashMLA asynchronous failure at the "
+                                    "parallel CP segment boundary"
+                                ) from err
                     else:
                         segment_outputs = [
                             launch_segment(spec, f"cp_segment_{segment_id}")
