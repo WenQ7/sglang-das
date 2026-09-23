@@ -64,11 +64,6 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
             f"speculative_eagle_topk={server_args.speculative_eagle_topk} "
             "(only topk=1 is supported)"
         )
-    if resolved_view(server_args).enable_dp_attention:
-        return (
-            "enable_dp_attention=True is not supported "
-            "(adaptive tier decisions are not synchronized across DP ranks)"
-        )
     if resolved_view(server_args).enable_multi_layer_eagle:
         return (
             "enable_multi_layer_eagle=True is not supported "

@@ -2222,6 +2222,20 @@ class Scheduler(
             get_require_mlp_sync=lambda: self.require_mlp_sync,
             get_pd_decode_step_context=self.get_pd_decode_step_context,
             set_dp_scheduler_epoch=self.set_dp_scheduler_epoch,
+            take_pending_adaptive_stats=getattr(
+                self.model_worker,
+                "take_pending_adaptive_stats",
+                lambda: (0, 0, 0),
+            ),
+            on_adaptive_stats_synchronized=getattr(
+                self.model_worker,
+                "on_adaptive_stats_synchronized",
+                lambda _accepted, _count, _batch: None,
+            ),
+            adaptive_sync_enabled=(
+                self.server_args.speculative_adaptive
+                and get_parallel().attn_dp_size > 1
+            ),
         )
 
     def init_pool_stats_observer(self) -> None:
@@ -3297,6 +3311,22 @@ class Scheduler(
 
             if self.dllm_config is not None and last_batch.reqs:
                 chunked_req_to_exclude.update(last_batch.reqs)
+
+            # The overlap loop reaches here before the previous Prefill result
+            # is processed.  Its final chunk already sampled one token, so a
+            # max_new_tokens=1 request is complete in the pending result even
+            # though req.finished() is not set yet.  Do not merge such requests
+            # into running_batch and launch a needless one-token decode.  Apart
+            # from wasted work, that lookahead can pair with a CP Prefill on a
+            # different attention-DP replica and force an expensive mixed
+            # full-TP forward.
+            if self.enable_overlap and last_batch.contains_last_prefill_chunk:
+                chunked_req_to_exclude.update(
+                    req
+                    for req in last_batch.reqs
+                    if req.inflight_middle_chunks <= 0
+                    and req.finishes_after_pending_token()
+                )
 
             # Filter batch
             last_bs = last_batch.batch_size()

@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Callable, Protocol
 
 from sglang.srt.speculative.adaptive_spec_params import AdaptiveSpeculativeParams
 
@@ -71,17 +71,30 @@ class AdaptiveController:
       2. Call on_verify_complete(num_correct_drafts_per_req) after each decode verify.
     """
 
-    def __init__(self, worker: AdaptiveSpecWorker, config_path: str | None = None):
+    def __init__(
+        self,
+        worker: AdaptiveSpecWorker,
+        config_path: str | None = None,
+        stats_synchronizer: (
+            Callable[[list[int], int], tuple[list[float], int]] | None
+        ) = None,
+    ):
         self.worker = worker
         self.params = AdaptiveSpeculativeParams(
             initial_steps=worker.speculative_num_steps,
             cfg_path=config_path,
         )
         self._states: dict[int, SpecRuntimeState] = {}
+        self._stats_synchronizer = stats_synchronizer
+        self._last_synchronized_batch_size: int | None = None
 
     @property
     def candidate_steps(self) -> list[int]:
         return self.params.candidate_steps
+
+    @property
+    def has_synchronized_stats(self) -> bool:
+        return self._last_synchronized_batch_size is not None
 
     def register(self, state: SpecRuntimeState, steps: int | None = None) -> None:
         """Register a pre-built runtime state.
@@ -111,7 +124,16 @@ class AdaptiveController:
         self._activate(self.worker.speculative_num_steps)
 
     def activate_step_by_batch(self, batch_size: int) -> None:
-        target = self.params.get_steps_for_batch(batch_size)
+        # Under attention-DP/EP, local request counts may differ.  Reuse the
+        # most recent execution-group maximum so every rank selects the same
+        # graph/depth.  The initial round starts from the launch-time state on
+        # every rank; synchronization is established after its verify.
+        routed_batch_size = (
+            self._last_synchronized_batch_size
+            if self._last_synchronized_batch_size is not None
+            else batch_size
+        )
+        target = self.params.get_steps_for_batch(routed_batch_size)
         if target != self.worker.speculative_num_steps:
             self._activate(target)
 
@@ -119,6 +141,23 @@ class AdaptiveController:
         self, num_correct_drafts_per_req: list[int], batch_size: int
     ) -> None:
         """Feed verify results; switch runtime state if EMA warrants it."""
+        if self._stats_synchronizer is not None:
+            num_correct_drafts_per_req, batch_size = self._stats_synchronizer(
+                num_correct_drafts_per_req, batch_size
+            )
+            self._last_synchronized_batch_size = batch_size
+        self._update_from_verify_stats(num_correct_drafts_per_req, batch_size)
+
+    def on_synchronized_verify_complete(
+        self, num_correct_drafts_per_req: list[float], batch_size: int
+    ) -> None:
+        """Feed stats already synchronized by the execution scheduler."""
+        self._last_synchronized_batch_size = batch_size
+        self._update_from_verify_stats(num_correct_drafts_per_req, batch_size)
+
+    def _update_from_verify_stats(
+        self, num_correct_drafts_per_req: list[float], batch_size: int
+    ) -> None:
         new_step = self.params.on_verify_complete(
             num_correct_drafts_per_req, batch_size
         )

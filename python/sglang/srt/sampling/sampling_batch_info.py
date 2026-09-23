@@ -40,6 +40,42 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def is_greedy_top1_sampling_eligible(
+    sampling_info: Optional[SamplingBatchInfo],
+    *,
+    has_grammar: bool = False,
+    return_logprob: bool = False,
+) -> bool:
+    """Return whether a whole batch needs only the unmodified greedy argmax."""
+    if return_logprob or has_grammar:
+        return False
+    # CUDA-graph capture uses synthetic batches without sampling metadata.
+    if sampling_info is None:
+        return True
+    if not sampling_info.is_all_greedy:
+        return False
+    if sampling_info.has_custom_logit_processor:
+        return False
+    if getattr(sampling_info, "acc_additive_penalties", None) is not None:
+        return False
+    if getattr(sampling_info, "acc_scaling_penalties", None) is not None:
+        return False
+    penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
+    if penalizer is not None and penalizer.is_required:
+        return False
+    if getattr(sampling_info, "logit_bias", None) is not None:
+        return False
+    if getattr(sampling_info, "grammar_mask", None) is not None:
+        return False
+    grammars = getattr(sampling_info, "grammars", None)
+    if grammars and any(grammar is not None for grammar in grammars):
+        return False
+    sampling_masks = getattr(sampling_info, "return_sampling_masks", None)
+    if sampling_masks and any(sampling_masks):
+        return False
+    return True
+
+
 @dataclasses.dataclass
 class SamplingBatchInfo:
     # Basic batched sampling params

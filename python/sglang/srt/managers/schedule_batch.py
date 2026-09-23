@@ -1283,6 +1283,16 @@ class Req(ReqDllmMixin):
         # Whether request reached finished condition
         return self.finished_reason is not None
 
+    def finishes_after_pending_token(self) -> bool:
+        """Whether one already-launched token will reach the length cap.
+
+        The overlap scheduler plans the next iteration before processing the
+        current forward result.  For a final Prefill chunk, that result already
+        contains one sampled token.  Requests at the cap must not be promoted
+        into a speculative one-token decode batch while that result is pending.
+        """
+        return len(self.output_ids) + 1 >= self.sampling_params.max_new_tokens
+
     def set_extend_range(self, start: int, end: int) -> None:
         self.extend_range = Range(start, end)
 
@@ -2149,6 +2159,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     can_run_dp_breakable_cuda_graph: bool = False
+    # DP-synchronized admission for direct target-verify greedy Top-1.  All
+    # ranks must select the same output protocol around EP/DeepEP collectives.
+    target_verify_greedy_top1_eligible: bool = True
     tbo_split_seq_index: Optional[int] = None
     # Rank-consistent forward mode for the recv skipper, derived from the MLP
     # sync all-gather (the TBO-only `global_forward_mode` is None without TBO).
@@ -3346,6 +3359,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             global_cp_num_tokens=self.global_cp_num_tokens,
             can_run_dp_cuda_graph=self.can_run_dp_cuda_graph,
             can_run_dp_breakable_cuda_graph=self.can_run_dp_breakable_cuda_graph,
+            target_verify_greedy_top1_eligible=self.target_verify_greedy_top1_eligible,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,

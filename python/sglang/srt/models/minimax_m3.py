@@ -1539,6 +1539,110 @@ class MiniMaxM3Model(nn.Module):
         return hidden_states, aux_hidden_states
 
 
+_TARGET_LM_HEAD_TOP1_BACKENDS = {
+    "triton_bf16_fused",
+    "lightop",
+    "lightop_fp8",
+    "triton_fused",
+    "triton_fp8_fused",
+}
+
+
+def init_minimax_target_lm_head_top1(module: nn.Module) -> None:
+    """Install target-verify Top-1 state on text and multimodal wrappers."""
+    module.use_target_verify_lm_head_top1 = (
+        module.pp_group.is_last_rank
+        and envs.SGLANG_OPT_USE_EAGLE3_TARGET_LM_HEAD_TOP1.get()
+    )
+    module.target_verify_lm_head_top1_min_rows = (
+        envs.SGLANG_EAGLE3_TARGET_LM_HEAD_TOP1_MIN_ROWS.get()
+    )
+    module.target_verify_lm_head_top1_backend = (
+        envs.SGLANG_EAGLE3_TARGET_LM_HEAD_TOP1_BACKEND.get()
+    )
+    if module.target_verify_lm_head_top1_min_rows < 1:
+        raise ValueError("SGLANG_EAGLE3_TARGET_LM_HEAD_TOP1_MIN_ROWS must be >= 1")
+    if module.target_verify_lm_head_top1_backend not in _TARGET_LM_HEAD_TOP1_BACKENDS:
+        raise ValueError(
+            "SGLANG_EAGLE3_TARGET_LM_HEAD_TOP1_BACKEND must be one of "
+            f"{sorted(_TARGET_LM_HEAD_TOP1_BACKENDS)}, got "
+            f"{module.target_verify_lm_head_top1_backend!r}"
+        )
+    module.register_buffer("_target_lm_head_fp8_weight", None, persistent=False)
+    module.register_buffer("_target_lm_head_fp8_scale", None, persistent=False)
+
+    if module.use_target_verify_lm_head_top1:
+        log_info_on_rank0(
+            logger,
+            "MiniMax-M3 target verify uses direct LM-head Top-1 "
+            f"(backend={module.target_verify_lm_head_top1_backend}, "
+            f"min_rows={module.target_verify_lm_head_top1_min_rows}).",
+        )
+
+
+def post_load_minimax_target_lm_head_top1(module: nn.Module) -> None:
+    """Build an optional FP8 copy of the local vocab shard after loading."""
+    if not module.use_target_verify_lm_head_top1:
+        return
+    if module.target_verify_lm_head_top1_backend == "triton_bf16_fused":
+        return
+    if module._target_lm_head_fp8_weight is not None:
+        return
+    weight = getattr(module.lm_head, "weight", None)
+    if weight is None or weight.dtype not in (torch.float16, torch.bfloat16):
+        raise RuntimeError(
+            "target FP8 Top-1 requires an unquantized FP16/BF16 LM-head, got "
+            f"{getattr(weight, 'dtype', None)}"
+        )
+    if getattr(module.lm_head, "bias", None) is not None:
+        raise RuntimeError("target FP8 Top-1 does not support an LM-head bias")
+    if module.lm_head.num_embeddings != module.lm_head.org_vocab_size:
+        raise RuntimeError("target FP8 Top-1 does not support added vocabulary")
+    from sglang.kernels.ops.speculative.fp8_lm_head_top1 import (
+        quantize_lm_head_weight_fp8_per_channel,
+    )
+
+    module._target_lm_head_fp8_weight, module._target_lm_head_fp8_scale = (
+        quantize_lm_head_weight_fp8_per_channel(weight)
+    )
+    log_info_on_rank0(
+        logger,
+        "MiniMax-M3 target LM-head local vocab shard was quantized to "
+        f"per-channel FP8 ({tuple(weight.shape)}).",
+    )
+
+
+def maybe_forward_minimax_target_lm_head_top1(
+    module: nn.Module,
+    input_ids: torch.Tensor,
+    hidden_states: torch.Tensor,
+    forward_batch: ForwardBatch,
+    aux_hidden_states,
+):
+    """Return the target Top-1 output, or None for the ordinary logits path."""
+    if not forward_batch.forward_mode.is_target_verify():
+        return None
+    if not module.use_target_verify_lm_head_top1:
+        return None
+    # Direct Top-1 deliberately omits the vocabulary logits required by
+    # sampling modifiers.  Unsupported and mixed batches transparently use the
+    # ordinary logits processor instead of surfacing a request-time error.
+    if not is_target_verify_greedy_top1_eligible(forward_batch):
+        return None
+    candidate = module.logits_processor.forward_target_verify_top1(
+        input_ids,
+        hidden_states,
+        module.lm_head,
+        forward_batch,
+        aux_hidden_states,
+        fused_min_rows=module.target_verify_lm_head_top1_min_rows,
+        backend=module.target_verify_lm_head_top1_backend,
+        fp8_weight=module._target_lm_head_fp8_weight,
+        fp8_weight_scale=module._target_lm_head_fp8_scale,
+    )
+    return candidate
+
+
 class MiniMaxM3SparseForCausalLM(nn.Module):
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={".block_sparse_moe.": ".mlp."}

@@ -1672,6 +1672,21 @@ class Envs:
     # DeepEP uses a replicated TP1 shared expert; long-prefill configurations
     # can overlap it with routed A2A/GEMMs when CU contention is favorable.
     SGLANG_OPT_USE_MINIMAX_DEEPEP_SHARED_EXPERT_OVERLAP = EnvBool(False)
+    # EAGLE3-only greedy draft path: reduce Top-1 immediately after each
+    # rank-local LM-head GEMM and exchange candidates instead of full logits.
+    SGLANG_OPT_USE_EAGLE3_LM_HEAD_TOP1 = EnvBool(False)
+    # Greedy EAGLE target verifier: avoid the full target vocabulary logits
+    # tensor when the sampling contract allows a direct Top-1 result.
+    SGLANG_OPT_USE_EAGLE3_TARGET_LM_HEAD_TOP1 = EnvBool(False)
+    SGLANG_EAGLE3_TARGET_LM_HEAD_TOP1_MIN_ROWS = EnvInt(8)
+    SGLANG_EAGLE3_TARGET_LM_HEAD_TOP1_BACKEND = EnvStr("triton_bf16_fused")
+    # ROCm BF16 full-logits LM-head dispatch. Keep it opt-in because different
+    # accumulation orders can alter near-tie logits and speculative acceptance.
+    SGLANG_OPT_USE_HIPBLASLT_BF16_LM_HEAD = EnvBool(False)
+    SGLANG_HIPBLASLT_BF16_LM_HEAD_MIN_ROWS = EnvInt(8)
+    # Draft Top-1 backend. The production EAGLE3 configuration uses
+    # ``lightop_fp8``; BF16 and fused Triton variants remain explicit options.
+    SGLANG_EAGLE3_LM_HEAD_TOP1_BACKEND = EnvStr("lightop_fp8")
     # Fused JIT store (minimax_store_kv_index) of main+index K/V instead of separate
     # set_*_buffer copies; falls back when main/index dtypes differ or non-CUDA.
     SGLANG_OPT_USE_MINIMAX_FUSED_KV_INDEX_STORE = EnvBool(True)
