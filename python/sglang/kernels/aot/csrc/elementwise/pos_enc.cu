@@ -173,7 +173,16 @@ void rotary_embedding(
   int64_t head_stride = (query_ndim == positions_ndim + 2) ? query.stride(-2) : head_size;
 
   dim3 grid(num_tokens);
-  dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, 512));
+#if defined(USE_ROCM) || defined(__HIP_PLATFORM_AMD__)
+  // The gfx938 sgl-kernel extension is compiled with a 256-thread launch
+  // bound.  EAGLE3 drafts commonly have 64 heads, which previously selected
+  // 512 threads and made HIP reject every RoPE launch.  The device helper is
+  // grid-stride over heads, so capping at 256 preserves the math.
+  constexpr int kMaxRotaryThreads = 256;
+#else
+  constexpr int kMaxRotaryThreads = 512;
+#endif
+  dim3 block(std::min<int64_t>(num_heads * rot_dim / 2, kMaxRotaryThreads));
   const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   DISPATCH_FLOAT_TYPES(query.scalar_type(), "rotary_embedding", [&] {
